@@ -22,24 +22,9 @@ from torch import Tensor
 
 from .distributed_state import DistributedFPSState
 
-
-
-
-
-
-
-
-
-
-
-
 # -----------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------
-
-
-
-
 
 
 # -----------------------------------------------------------------------
@@ -77,9 +62,7 @@ def _voronoi_step_dist(
         return
 
     # Triangle inequality (replicated, no communication)
-    dSL_quarter = (
-        norms_sel[:sel_pos] + norm_new - 2.0 * (X_sel[:sel_pos] @ center)
-    ) * 0.25
+    dSL_quarter = (norms_sel[:sel_pos] + norm_new - 2.0 * (X_sel[:sel_pos] @ center)) * 0.25
     vl_clamped = torch.clamp(v, max=sel_pos - 1)
     active_mask = dSL_quarter[vl_clamped] < h
 
@@ -143,13 +126,15 @@ def _reconstruct_hausdorff_dist(
 
             n_aff = len(affected_idx)
             min_to_added = torch.full(
-                (n_aff,), float("inf"), dtype=state.dtype, device=device,
+                (n_aff,),
+                float("inf"),
+                dtype=state.dtype,
+                device=device,
             )
 
             # Each rank computes distances for its local affected rows
-            local_mask = (
-                (affected_idx >= state.my_offset)
-                & (affected_idx < state.my_offset + state.n_local)
+            local_mask = (affected_idx >= state.my_offset) & (
+                affected_idx < state.my_offset + state.n_local
             )
 
             if local_mask.any():
@@ -160,7 +145,9 @@ def _reconstruct_hausdorff_dist(
 
                 min_local = torch.full(
                     (int(local_mask.sum().item()),),
-                    float("inf"), dtype=state.dtype, device=device,
+                    float("inf"),
+                    dtype=state.dtype,
+                    device=device,
                 )
                 chunk = max(1, 10_000_000 // max(int(local_mask.sum().item()), 1))
                 for start in range(0, m, chunk):
@@ -171,7 +158,9 @@ def _reconstruct_hausdorff_dist(
                         - 2.0 * (X_aff @ X_add[start:end].T)
                     )
                     torch.minimum(
-                        min_local, d_chunk.min(dim=1).values, out=min_local,
+                        min_local,
+                        d_chunk.min(dim=1).values,
+                        out=min_local,
                     )
 
                 local_positions = torch.where(local_mask)[0]
@@ -223,9 +212,16 @@ def _bisect_voronoi_dist(
             continue
 
         h_m, _ = _reconstruct_hausdorff_dist(
-            state, X_sel, norms_sel,
-            h_snap, h_final, v_final,
-            added, mid, n_snap, sel_start,
+            state,
+            X_sel,
+            norms_sel,
+            h_snap,
+            h_final,
+            v_final,
+            added,
+            mid,
+            n_snap,
+            sel_start,
         )
 
         # Fast path: kth-value bound (replicated h_m, no communication)
@@ -339,8 +335,14 @@ def accrete(
     selected_set: Set[int] = {first}
     current_sep = float("inf")
     _voronoi_step_dist(
-        state, hausdorff, voronoi, X_sel, norms_sel,
-        first, 0, full_threshold,
+        state,
+        hausdorff,
+        voronoi,
+        X_sel,
+        norms_sel,
+        first,
+        0,
+        full_threshold,
     )
 
     if verbose and rank == 0:
@@ -382,7 +384,9 @@ def accrete(
 
             for step in range(max_add):
                 pool_t = torch.tensor(
-                    pool_buf, dtype=torch.long, device=device,
+                    pool_buf,
+                    dtype=torch.long,
+                    device=device,
                 )
                 best_pos = int(torch.argmax(hausdorff[pool_t]).item())
                 best_idx = pool_buf[best_pos]
@@ -400,8 +404,14 @@ def accrete(
                 selected_set.add(best_idx)
 
                 _voronoi_step_dist(
-                    state, hausdorff, voronoi, X_sel, norms_sel,
-                    best_idx, sel_pos, full_threshold,
+                    state,
+                    hausdorff,
+                    voronoi,
+                    X_sel,
+                    norms_sel,
+                    best_idx,
+                    sel_pos,
+                    full_threshold,
                 )
 
                 pool_buf[best_pos] = pool_buf[-1]
@@ -415,9 +425,17 @@ def accrete(
             v_final = voronoi.clone()
 
             best_m = _bisect_voronoi_dist(
-                state, X_sel, norms_sel,
-                h_snap, h_final, v_final,
-                sel_snap, added, step_seps, points_needed, n_snap,
+                state,
+                X_sel,
+                norms_sel,
+                h_snap,
+                h_final,
+                v_final,
+                sel_snap,
+                added,
+                step_seps,
+                points_needed,
+                n_snap,
             )
 
             # --- Restore snapshot and replay best_m steps ---
@@ -435,8 +453,14 @@ def accrete(
                 current_sep = step_seps[j + 1]
 
                 _voronoi_step_dist(
-                    state, hausdorff, voronoi, X_sel, norms_sel,
-                    idx, sel_pos, full_threshold,
+                    state,
+                    hausdorff,
+                    voronoi,
+                    X_sel,
+                    norms_sel,
+                    idx,
+                    sel_pos,
+                    full_threshold,
                 )
 
             points_needed -= best_m
@@ -452,8 +476,14 @@ def accrete(
             selected_set.add(best_idx)
 
             _voronoi_step_dist(
-                state, hausdorff, voronoi, X_sel, norms_sel,
-                best_idx, sel_pos, full_threshold,
+                state,
+                hausdorff,
+                voronoi,
+                X_sel,
+                norms_sel,
+                best_idx,
+                sel_pos,
+                full_threshold,
             )
             points_needed -= 1
 
@@ -469,7 +499,9 @@ def accrete(
         sep_sq = current_sep
         sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
         cov_val = math.sqrt(cov_sq)
-        rel_gap = (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
+        rel_gap = (
+            (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
+        )
 
         if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_VIOLATION_REL):
             raise RuntimeError(

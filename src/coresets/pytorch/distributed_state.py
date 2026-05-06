@@ -47,37 +47,27 @@ class DistributedFPSState:
         # --- exchange shard sizes so every rank knows the global layout ---
         n_local_t = torch.tensor([self.n_local], dtype=torch.int64, device=self.device)
         sizes_list = [
-            torch.zeros(1, dtype=torch.int64, device=self.device)
-            for _ in range(world_size)
+            torch.zeros(1, dtype=torch.int64, device=self.device) for _ in range(world_size)
         ]
         dist.all_gather(sizes_list, n_local_t)
         self.all_sizes: List[int] = [int(x.item()) for x in sizes_list]
         self.N: int = sum(self.all_sizes)
-        self.offsets: List[int] = [
-            sum(self.all_sizes[:i]) for i in range(world_size)
-        ]
+        self.offsets: List[int] = [sum(self.all_sizes[:i]) for i in range(world_size)]
         self.my_offset: int = self.offsets[rank]
         # cumulative boundaries for bisect-based owner lookup
-        self._cum: List[int] = [0] + [
-            sum(self.all_sizes[: i + 1]) for i in range(world_size)
-        ]
+        self._cum: List[int] = [0] + [sum(self.all_sizes[: i + 1]) for i in range(world_size)]
 
         # --- sharded data (O(N*D) total, split across ranks) ---
         self.X_local = X_local
         self.norms_local = (X_local * X_local).sum(dim=1)
 
         # --- scratch / communication buffers ---
-        self.d_local = torch.empty(
-            self.n_local, dtype=self.dtype, device=self.device
-        )
+        self.d_local = torch.empty(self.n_local, dtype=self.dtype, device=self.device)
         self._center = torch.empty(self.D, dtype=self.dtype, device=self.device)
         self._d_bufs: List[Tensor] = [
-            torch.empty(s, dtype=self.dtype, device=self.device)
-            for s in self.all_sizes
+            torch.empty(s, dtype=self.dtype, device=self.device) for s in self.all_sizes
         ]
-        self._d_full = torch.empty(
-            self.N, dtype=self.dtype, device=self.device
-        )
+        self._d_full = torch.empty(self.N, dtype=self.dtype, device=self.device)
 
     # ------------------------------------------------------------------
 
@@ -113,8 +103,12 @@ class DistributedFPSState:
         norm_new = (center * center).sum()
         self.d_local.copy_(self.norms_local).add_(norm_new)
         torch.addmv(
-            self.d_local, self.X_local, center,
-            beta=1, alpha=-2, out=self.d_local,
+            self.d_local,
+            self.X_local,
+            center,
+            beta=1,
+            alpha=-2,
+            out=self.d_local,
         )
         dist.all_gather(self._d_bufs, self.d_local)
         off = 0
@@ -125,7 +119,9 @@ class DistributedFPSState:
         return self._d_full
 
     def compute_distances_sparse(
-        self, center: Tensor, active_mask: Tensor,
+        self,
+        center: Tensor,
+        active_mask: Tensor,
     ) -> Tensor:
         """Like :meth:`compute_distances` but only computes rows where
         *active_mask* is True.  Inactive positions are set to ``inf``.
@@ -139,10 +135,7 @@ class DistributedFPSState:
 
         if local_active.any():
             idx = torch.where(local_active)[0]
-            d_act = (
-                self.norms_local[idx] + norm_new
-                - 2.0 * (self.X_local[idx] @ center)
-            )
+            d_act = self.norms_local[idx] + norm_new - 2.0 * (self.X_local[idx] @ center)
             self.d_local[idx] = d_act
 
         dist.all_gather(self._d_bufs, self.d_local)

@@ -13,12 +13,16 @@ from .ext import ensure_compiled, get_ext
 
 
 def voronoi_step(
-    X: Tensor, norms: Tensor,
-    hausdorff: Tensor, voronoi: Tensor,
-    X_sel: Tensor, norms_sel: Tensor,
-    dSL_quarter: Tensor,    # pre-allocated scratch [max_sel] float32
-    d_out_idx: Tensor,      # pre-allocated scratch [1] int32
-    new_idx: int, sel_pos: int,
+    X: Tensor,
+    norms: Tensor,
+    hausdorff: Tensor,
+    voronoi: Tensor,
+    X_sel: Tensor,
+    norms_sel: Tensor,
+    dSL_quarter: Tensor,  # pre-allocated scratch [max_sel] float32
+    d_out_idx: Tensor,  # pre-allocated scratch [1] int32
+    new_idx: int,
+    sel_pos: int,
 ) -> None:
     """Sparse update step — fused CUDA kernels, no D2H per step.
 
@@ -43,6 +47,12 @@ def voronoi_step(
     else:
         ext.compute_dSL_quarter_cuda(X_sel, norms_sel, dSL_quarter, sel_pos)
         ext.voronoi_update_cuda(
-            X, norms, x_new, dSL_quarter[:sel_pos],
-            hausdorff, voronoi, norm_new_t, sel_pos,
+            X,
+            norms,
+            x_new,
+            dSL_quarter[:sel_pos],
+            hausdorff,
+            voronoi,
+            norm_new_t,
+            sel_pos,
         )

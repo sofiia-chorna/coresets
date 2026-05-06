@@ -37,14 +37,18 @@ def run_single_gpu():
     warmup_fast_fps()  # JIT-compile kernels before timing-sensitive code.
 
     coreset = accrete(
-        X_anchor, X_candidates, anchor_order,
+        X_anchor,
+        X_candidates,
+        anchor_order,
         max_k=14,
         verbose=True,
     )
 
     n_from_anchor = int((coreset < n_anchor).sum().item())
-    print(f"\nFinal coreset: {coreset.numel():,} points "
-          f"({n_from_anchor:,} from anchor, {coreset.numel() - n_from_anchor:,} from candidates)")
+    print(
+        f"\nFinal coreset: {coreset.numel():,} points "
+        f"({n_from_anchor:,} from anchor, {coreset.numel() - n_from_anchor:,} from candidates)"
+    )
     return coreset.cpu().numpy()
 
 
@@ -89,9 +93,11 @@ def run_sharded():
 
     if rank == 0:
         n_from_anchor = int((coreset < n_anchor).sum().item())
-        print(f"\nFinal coreset: {coreset.numel():,} points "
-              f"({n_from_anchor:,} from anchor, "
-              f"{coreset.numel() - n_from_anchor:,} from candidates)")
+        print(
+            f"\nFinal coreset: {coreset.numel():,} points "
+            f"({n_from_anchor:,} from anchor, "
+            f"{coreset.numel() - n_from_anchor:,} from candidates)"
+        )
     dist.destroy_process_group()
     return coreset.cpu().numpy() if rank == 0 else None
 

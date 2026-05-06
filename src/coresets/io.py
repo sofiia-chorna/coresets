@@ -66,7 +66,9 @@ def _git_commit(cwd: Optional[PathLike] = None) -> Optional[str]:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=str(cwd) if cwd else None,
-            capture_output=True, text=True, timeout=2,
+            capture_output=True,
+            text=True,
+            timeout=2,
         )
         return out.stdout.strip() if out.returncode == 0 else None
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -116,11 +118,10 @@ def init_run(
     root = Path(results_root) / run_name
     if root.exists():
         if not overwrite:
-            raise FileExistsError(
-                f"run already exists: {root}. Pass overwrite=True to wipe."
-            )
+            raise FileExistsError(f"run already exists: {root}. Pass overwrite=True to wipe.")
         # Recursive delete is dangerous; require explicit overwrite.
         import shutil
+
         shutil.rmtree(root)
     root.mkdir(parents=True)
 
@@ -200,6 +201,7 @@ def _step_dir(run_dir: Path, step_idx: int, name: str) -> Path:
 @dataclass
 class StepStats:
     """Summary of a step. Forms the body of ``step.json``."""
+
     max_k: int
     n_anchor: int
     n_candidates: int
@@ -256,9 +258,7 @@ def save_step(
 
     run_dir = Path(results_root) / run_name
     if not (run_dir / "manifest.json").is_file():
-        raise FileNotFoundError(
-            f"no manifest at {run_dir}; call init_run first."
-        )
+        raise FileNotFoundError(f"no manifest at {run_dir}; call init_run first.")
 
     if step_idx is None:
         step_idx = _next_step_idx(run_dir)
@@ -353,9 +353,11 @@ def _resolve_step_dir(run_dir: Path, name: str) -> Path:
     """Accept either ``002_after_b1`` or just ``after_b1`` (latest match wins)."""
     if (run_dir / name).is_dir():
         return run_dir / name
-    matches = [p for p in run_dir.iterdir()
-               if p.is_dir() and _STEP_DIR_RE.match(p.name)
-               and _STEP_DIR_RE.match(p.name).group(2) == name]
+    matches = [
+        p
+        for p in run_dir.iterdir()
+        if p.is_dir() and _STEP_DIR_RE.match(p.name) and _STEP_DIR_RE.match(p.name).group(2) == name
+    ]
     if not matches:
         raise FileNotFoundError(f"no step matching {name!r} in {run_dir}")
     matches.sort()
@@ -395,8 +397,13 @@ class _PerLevelWriter:
         self._fh.write(_PER_LEVEL_HEADER)
 
     def write(
-        self, k: int, size: int, sep: float, cov: float,
-        rel_gap: float, walltime_s: float,
+        self,
+        k: int,
+        size: int,
+        sep: float,
+        cov: float,
+        rel_gap: float,
+        walltime_s: float,
     ) -> None:
         self._fh.write(f"{k}\t{size}\t{sep:.10g}\t{cov:.10g}\t{rel_gap:.10g}\t{walltime_s:.6f}\n")
         self._fh.flush()
@@ -417,8 +424,12 @@ def append_per_level(
     run_name: str,
     step_name_or_dir: str,
     *,
-    k: int, size: int, sep: float, cov: float,
-    rel_gap: float, walltime_s: float,
+    k: int,
+    size: int,
+    sep: float,
+    cov: float,
+    rel_gap: float,
+    walltime_s: float,
 ) -> None:
     """Convenience: append one row to a step's per_level.tsv (creates with
     header on first call). Use ``open_per_level`` for hot-loop writes."""

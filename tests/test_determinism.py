@@ -69,16 +69,19 @@ def run_single(args):
 
     X = make_synthetic(N, D).to(device)
     idx_A = torch.arange(N // 2, dtype=torch.long, device=device)  # first half is "A"
-    X_A = X[:N // 2]
-    X_C = X[N // 2:]
+    X_A = X[: N // 2]
+    X_C = X[N // 2 :]
 
     warmup_fast_fps()
     torch.cuda.synchronize()
 
     # accrete is the single-GPU path used by benchmark_cuda.py
     result = accrete(
-        X_A, X_C, idx_A,
-        max_k=max_k, verbose=False,
+        X_A,
+        X_C,
+        idx_A,
+        max_k=max_k,
+        verbose=False,
         trace_path=args.trace,
     )
     idx = result.cpu().numpy()
@@ -91,7 +94,7 @@ def run_single(args):
 def run_multi(args):
     from coresets._cuda_multi import accrete_voronoi_multi
 
-    rank       = int(os.environ["RANK"])
+    rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
@@ -105,16 +108,20 @@ def run_multi(args):
 
     X = make_synthetic(N, D).to(device)
     idx_A = torch.arange(N // 2, dtype=torch.long, device=device)
-    X_A = X[:N // 2]
-    X_C = X[N // 2:]
+    X_A = X[: N // 2]
+    X_C = X[N // 2 :]
 
     warmup_fast_fps()
     dist.barrier()
 
     result = accrete_voronoi_multi(
-        X_A, X_C, idx_A,
-        rank=rank, world_size=world_size,
-        max_k=max_k, verbose=False,
+        X_A,
+        X_C,
+        idx_A,
+        rank=rank,
+        world_size=world_size,
+        max_k=max_k,
+        verbose=False,
         trace_path=args.trace,
     )
 
@@ -149,7 +156,7 @@ def run_sharded(args):
         compute_shard_layout,
     )
 
-    rank       = int(os.environ["RANK"])
+    rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
@@ -168,7 +175,7 @@ def run_sharded(args):
     idx_A = torch.arange(N // 2, dtype=torch.long, device=device)
 
     sizes, offsets = compute_shard_layout(N, world_size)
-    N_shard      = sizes[rank]
+    N_shard = sizes[rank]
     shard_offset = offsets[rank]
     X_local = X_full_cpu[shard_offset : shard_offset + N_shard].to(device).contiguous()
     # Reference runs build X_full and slice views — we do the equivalent on
@@ -179,10 +186,14 @@ def run_sharded(args):
 
     result = accrete_voronoi_multi_sharded(
         X_local,
-        rank=rank, world_size=world_size,
-        N_A_global=N // 2, N_global=N,
-        shard_sizes=sizes, idx_A=idx_A,
-        max_k=max_k, verbose=False,
+        rank=rank,
+        world_size=world_size,
+        N_A_global=N // 2,
+        N_global=N,
+        shard_sizes=sizes,
+        idx_A=idx_A,
+        max_k=max_k,
+        verbose=False,
         trace_path=args.trace,
     )
 
@@ -217,13 +228,19 @@ def main():
     ap.add_argument("--N", type=int, default=8192)
     ap.add_argument("--D", type=int, default=32)
     ap.add_argument("--K", type=int, default=2048)
-    ap.add_argument("--out", type=str, default="ref_indices.npy",
-                    help="output file for --mode single")
-    ap.add_argument("--ref", type=str, default="ref_indices.npy",
-                    help="reference file for --mode multi/sharded")
-    ap.add_argument("--trace", type=str, default=None,
-                    help="if set, per-commit TSV trace written to this path "
-                         "(rank 0 only in multi/sharded mode)")
+    ap.add_argument(
+        "--out", type=str, default="ref_indices.npy", help="output file for --mode single"
+    )
+    ap.add_argument(
+        "--ref", type=str, default="ref_indices.npy", help="reference file for --mode multi/sharded"
+    )
+    ap.add_argument(
+        "--trace",
+        type=str,
+        default=None,
+        help="if set, per-commit TSV trace written to this path "
+        "(rank 0 only in multi/sharded mode)",
+    )
     args = ap.parse_args()
 
     if args.mode == "single":

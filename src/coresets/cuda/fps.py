@@ -61,18 +61,18 @@ def fps(
     device = X.device
     norms = (X * X).sum(dim=1).to(torch.float32)
 
-    hausdorff   = torch.full((N,), float("inf"), dtype=torch.float32, device=device)
-    voronoi     = torch.zeros(N, dtype=torch.int64, device=device)
-    X_sel       = torch.empty((n_to_select, D), dtype=X.dtype, device=device)
-    norms_sel   = torch.empty(n_to_select, dtype=torch.float32, device=device)
+    hausdorff = torch.full((N,), float("inf"), dtype=torch.float32, device=device)
+    voronoi = torch.zeros(N, dtype=torch.int64, device=device)
+    X_sel = torch.empty((n_to_select, D), dtype=X.dtype, device=device)
+    norms_sel = torch.empty(n_to_select, dtype=torch.float32, device=device)
     dSL_quarter = torch.empty(n_to_select, dtype=torch.float32, device=device)
-    d_out_idx   = torch.empty(1, dtype=torch.int32, device=device)
+    d_out_idx = torch.empty(1, dtype=torch.int32, device=device)
 
     # Argmax scratch — the two-phase reduction's intermediate buffers.
-    n_blocks   = int(ext.MAX_ARGMAX_BLOCKS)
+    n_blocks = int(ext.MAX_ARGMAX_BLOCKS)
     block_vals = torch.empty(n_blocks, dtype=torch.float32, device=device)
-    block_idxs = torch.empty(n_blocks, dtype=torch.int32,   device=device)
-    d_out_val  = torch.empty(1, dtype=torch.float32, device=device)
+    block_idxs = torch.empty(n_blocks, dtype=torch.int32, device=device)
+    d_out_val = torch.empty(1, dtype=torch.float32, device=device)
 
     sel = torch.empty(n_to_select, dtype=torch.long, device=device)
 
@@ -87,13 +87,13 @@ def fps(
         for i in range(m):
             idx = int(seed_g[i].item())
             sel[i] = idx
-            voronoi_step(X, norms, hausdorff, voronoi, X_sel, norms_sel,
-                         dSL_quarter, d_out_idx, idx, i)
+            voronoi_step(
+                X, norms, hausdorff, voronoi, X_sel, norms_sel, dSL_quarter, d_out_idx, idx, i
+            )
         start = m
     else:
         sel[0] = 0
-        voronoi_step(X, norms, hausdorff, voronoi, X_sel, norms_sel,
-                     dSL_quarter, d_out_idx, 0, 0)
+        voronoi_step(X, norms, hausdorff, voronoi, X_sel, norms_sel, dSL_quarter, d_out_idx, 0, 0)
         start = 1
 
     # Inner loop: argmax_cuda → voronoi_step. Both custom kernels; only D2H
@@ -102,7 +102,6 @@ def fps(
         ext.argmax_cuda(hausdorff, block_vals, block_idxs, d_out_val, d_out_idx, N)
         idx = int(d_out_idx.item())
         sel[i] = idx
-        voronoi_step(X, norms, hausdorff, voronoi, X_sel, norms_sel,
-                     dSL_quarter, d_out_idx, idx, i)
+        voronoi_step(X, norms, hausdorff, voronoi, X_sel, norms_sel, dSL_quarter, d_out_idx, idx, i)
 
     return sel

@@ -34,4 +34,4 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"coresets.cuda" = ["kernels.cu"]
+"coresets.cuda" = ["kernels/*.cu", "kernels/*.cuh"]

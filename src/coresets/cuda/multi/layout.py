@@ -33,6 +33,7 @@ def _owner_of(global_idx: int, sizes: List[int], offsets: List[int]) -> int:
             return r
     return G - 1
 
+
 def compute_shard_layout(N_global: int, world_size: int) -> Tuple[List[int], List[int]]:
     """Return (sizes, offsets) for the even shard split used by
     ``accrete_voronoi_multi_sharded``.  Each rank owns

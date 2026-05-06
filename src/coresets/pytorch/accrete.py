@@ -14,37 +14,21 @@ from torch import Tensor
 
 from .fps import fps_update
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # Merge two coreset hierarchies
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
-
-
 def _voronoi_step(
-    X: Tensor, norms: Tensor, d: Tensor,
-    hausdorff: Tensor, voronoi: Tensor,
-    X_sel: Tensor, norms_sel: Tensor,
-    new_idx: int, sel_pos: int,
+    X: Tensor,
+    norms: Tensor,
+    d: Tensor,
+    hausdorff: Tensor,
+    voronoi: Tensor,
+    X_sel: Tensor,
+    norms_sel: Tensor,
+    new_idx: int,
+    sel_pos: int,
     full_threshold: int,
 ) -> None:
     """One voronoi-accelerated FPS step: update hausdorff/voronoi in-place.
@@ -61,9 +45,7 @@ def _voronoi_step(
         fps_update(X, norms, d, hausdorff, voronoi, new_idx, sel_pos)
         return
 
-    dSL_quarter = (
-        norms_sel[:sel_pos] + norm_new - 2.0 * (X_sel[:sel_pos] @ x_new)
-    ) * 0.25
+    dSL_quarter = (norms_sel[:sel_pos] + norm_new - 2.0 * (X_sel[:sel_pos] @ x_new)) * 0.25
 
     active_mask = dSL_quarter[voronoi] < hausdorff
 
@@ -93,9 +75,14 @@ def _voronoi_step(
 
 
 def _reconstruct_hausdorff(
-    X: Tensor, norms: Tensor,
-    h_snap: Tensor, h_final: Tensor, v_final: Tensor,
-    added: List[int], m: int, n_snap: int,
+    X: Tensor,
+    norms: Tensor,
+    h_snap: Tensor,
+    h_final: Tensor,
+    v_final: Tensor,
+    added: List[int],
+    m: int,
+    n_snap: int,
     sel_start: List[int],
 ) -> Tuple[Tensor, float]:
     """Reconstruct hausdorff at prefix ``m`` of a restricted FPS run.
@@ -129,7 +116,8 @@ def _reconstruct_hausdorff(
             for start in range(0, m, chunk):
                 end = min(start + chunk, m)
                 d_chunk = (
-                    norms_aff.unsqueeze(1) + norms_add[start:end].unsqueeze(0)
+                    norms_aff.unsqueeze(1)
+                    + norms_add[start:end].unsqueeze(0)
                     - 2.0 * (X_aff @ X_add[start:end].T)
                 )
                 torch.minimum(min_to_added, d_chunk.min(dim=1).values, out=min_to_added)
@@ -145,10 +133,16 @@ def _reconstruct_hausdorff(
 
 
 def _bisect_voronoi(
-    X: Tensor, norms: Tensor,
-    h_snap: Tensor, h_final: Tensor, v_final: Tensor,
-    sel_start: List[int], added: List[int],
-    step_seps: List[float], total_budget: int, n_snap: int,
+    X: Tensor,
+    norms: Tensor,
+    h_snap: Tensor,
+    h_final: Tensor,
+    v_final: Tensor,
+    sel_start: List[int],
+    added: List[int],
+    step_seps: List[float],
+    total_budget: int,
+    n_snap: int,
 ) -> int:
     """Binary search for max viable prefix using voronoi-based reconstruction.
 
@@ -174,8 +168,15 @@ def _bisect_voronoi(
             continue
 
         h_m, _ = _reconstruct_hausdorff(
-            X, norms, h_snap, h_final, v_final,
-            added, mid, n_snap, sel_start,
+            X,
+            norms,
+            h_snap,
+            h_final,
+            v_final,
+            added,
+            mid,
+            n_snap,
+            sel_start,
         )
 
         # Fast path: kth-value bound
@@ -301,8 +302,16 @@ def accrete(
     selected_set: Set[int] = {first}
     current_sep = float("inf")
     _voronoi_step(
-        X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
-        first, 0, full_threshold,
+        X,
+        norms,
+        d,
+        hausdorff,
+        voronoi,
+        X_sel,
+        norms_sel,
+        first,
+        0,
+        full_threshold,
     )
 
     if verbose:
@@ -320,7 +329,7 @@ def accrete(
             continue
 
         # Target blocks from A's hierarchy: B_k, B_{k+1}, ...
-        target_blocks = nested_blocks[k - 1:]
+        target_blocks = nested_blocks[k - 1 :]
 
         for block_pool in target_blocks:
             if points_needed <= 0:
@@ -361,8 +370,16 @@ def accrete(
                 selected_set.add(best_idx)
 
                 _voronoi_step(
-                    X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
-                    best_idx, sel_pos, full_threshold,
+                    X,
+                    norms,
+                    d,
+                    hausdorff,
+                    voronoi,
+                    X_sel,
+                    norms_sel,
+                    best_idx,
+                    sel_pos,
+                    full_threshold,
                 )
 
                 pool_buf[best_pos] = pool_buf[-1]
@@ -376,8 +393,16 @@ def accrete(
             v_final = voronoi.clone()
 
             best_m = _bisect_voronoi(
-                X, norms, h_snap, h_final, v_final,
-                sel_snap, added, step_seps, points_needed, n_snap,
+                X,
+                norms,
+                h_snap,
+                h_final,
+                v_final,
+                sel_snap,
+                added,
+                step_seps,
+                points_needed,
+                n_snap,
             )
 
             # --- Restore snapshot and replay best_m steps ---
@@ -395,8 +420,16 @@ def accrete(
                 current_sep = step_seps[j + 1]
 
                 _voronoi_step(
-                    X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
-                    idx, sel_pos, full_threshold,
+                    X,
+                    norms,
+                    d,
+                    hausdorff,
+                    voronoi,
+                    X_sel,
+                    norms_sel,
+                    idx,
+                    sel_pos,
+                    full_threshold,
                 )
 
             points_needed -= best_m
@@ -412,8 +445,16 @@ def accrete(
             selected_set.add(best_idx)
 
             _voronoi_step(
-                X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
-                best_idx, sel_pos, full_threshold,
+                X,
+                norms,
+                d,
+                hausdorff,
+                voronoi,
+                X_sel,
+                norms_sel,
+                best_idx,
+                sel_pos,
+                full_threshold,
             )
             points_needed -= 1
 
@@ -430,7 +471,7 @@ def accrete(
         # (rel_gap < -1e-3, way below float32 noise) -- that's a real cascade
         # failure or implementation bug.  The authoritative check is the
         # float64 post-hoc verifier (tests/verify_parity.py).
-        GROSS_VIOLATION_REL = 1e-3   # abort if rel_gap < -GROSS_VIOLATION_REL
+        GROSS_VIOLATION_REL = 1e-3  # abort if rel_gap < -GROSS_VIOLATION_REL
 
         cov_sq = float(hausdorff.max().item())
         if cov_sq < 0.0:
@@ -438,7 +479,9 @@ def accrete(
         sep_sq = current_sep
         sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
         cov_val = math.sqrt(cov_sq)
-        rel_gap = (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
+        rel_gap = (
+            (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
+        )
 
         if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_VIOLATION_REL):
             raise RuntimeError(

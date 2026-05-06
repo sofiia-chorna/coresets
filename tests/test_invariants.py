@@ -42,13 +42,13 @@ def run(N: int = 4096, D: int = 16, K: int = 1024, seed: int = 0, eps_rel: float
     # exact ties are possible.
     n_clusters = 32
     centres = rng.standard_normal((n_clusters, D)).astype(np.float32)
-    cids    = rng.integers(0, n_clusters, size=N)
-    X_np    = centres[cids] + 0.1 * rng.standard_normal((N, D)).astype(np.float32)
-    X       = torch.from_numpy(X_np).cuda()
+    cids = rng.integers(0, n_clusters, size=N)
+    X_np = centres[cids] + 0.1 * rng.standard_normal((N, D)).astype(np.float32)
+    X = torch.from_numpy(X_np).cuda()
 
     idx_A = torch.tensor([0], dtype=torch.long, device="cuda")
-    X_A   = X[:1]
-    X_C   = X[1:]
+    X_A = X[:1]
+    X_C = X[1:]
     max_k = int(np.log2(K))
 
     warmup_fast_fps()
@@ -67,11 +67,11 @@ def run(N: int = 4096, D: int = 16, K: int = 1024, seed: int = 0, eps_rel: float
         S = X_cpu[sel[:layer_size]]
 
         # Coverage: max over X of min distance to S.
-        d2    = _pairwise_sqdist(X_cpu, S)
+        d2 = _pairwise_sqdist(X_cpu, S)
         cov_k = float(d2.min(dim=1).values.max().sqrt().item())
 
         # Separation: min pairwise distance within S (diag masked).
-        dS2   = _pairwise_sqdist(S, S)
+        dS2 = _pairwise_sqdist(S, S)
         dS2 += torch.eye(layer_size) * 1e30
         sep_k = float(dS2.min().sqrt().item())
 
@@ -79,19 +79,18 @@ def run(N: int = 4096, D: int = 16, K: int = 1024, seed: int = 0, eps_rel: float
         # here) vs float32 CUDA kernels may give ~1e-5 slack.
         tol = eps_rel * max(cov_k, 1e-9)
         ok_mono = cov_k <= prev_d + tol
-        ok_sep  = sep_k >= cov_k - tol
-        mark    = "OK" if (ok_mono and ok_sep) else "FAIL"
+        ok_sep = sep_k >= cov_k - tol
+        mark = "OK" if (ok_mono and ok_sep) else "FAIL"
 
-        print(f"{k:<4} {layer_size:<6} {cov_k:>12.6f} {sep_k:>12.6f} "
-              f"{mark:>8}")
+        print(f"{k:<4} {layer_size:<6} {cov_k:>12.6f} {sep_k:>12.6f} " f"{mark:>8}")
 
         if not ok_mono:
-            print(f"  !! monotone coverage broken: d_{k} = {cov_k:.6e} > "
-                  f"d_{k-1} = {prev_d:.6e}")
+            print(
+                f"  !! monotone coverage broken: d_{k} = {cov_k:.6e} > " f"d_{k-1} = {prev_d:.6e}"
+            )
             fails += 1
         if not ok_sep:
-            print(f"  !! Gonzalez bound broken: sep_{k} = {sep_k:.6e} < "
-                  f"d_{k} = {cov_k:.6e}")
+            print(f"  !! Gonzalez bound broken: sep_{k} = {sep_k:.6e} < " f"d_{k} = {cov_k:.6e}")
             fails += 1
         prev_d = cov_k
 

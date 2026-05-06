@@ -29,10 +29,10 @@ import numpy as np
 import torch
 from torch import Tensor
 
-
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
+
 
 def _load_indices(path: Optional[str]) -> Optional[np.ndarray]:
     if path is None:
@@ -59,6 +59,7 @@ def _load_features(feats_A: str, feats_C: str, device: torch.device) -> Tuple[Te
 # Cross-implementation comparison
 # ---------------------------------------------------------------------------
 
+
 def _compare_exact(name_a: str, a: np.ndarray, name_b: str, b: np.ndarray) -> bool:
     if a.shape != b.shape:
         print(f"  FAIL  {name_a} vs {name_b}: shapes differ {a.shape} vs {b.shape}")
@@ -67,18 +68,18 @@ def _compare_exact(name_a: str, a: np.ndarray, name_b: str, b: np.ndarray) -> bo
         print(f"  OK    {name_a} == {name_b} (bitwise identical, {len(a):,} indices)")
         return True
     diff = np.argmax(a != b)
-    print(f"  FAIL  {name_a} != {name_b}: first diff at position {diff} "
-          f"({name_a}[{diff}]={a[diff]} vs {name_b}[{diff}]={b[diff]})")
+    print(
+        f"  FAIL  {name_a} != {name_b}: first diff at position {diff} "
+        f"({name_a}[{diff}]={a[diff]} vs {name_b}[{diff}]={b[diff]})"
+    )
     return False
 
 
-def _level_overlap(name_a: str, a: np.ndarray, name_b: str, b: np.ndarray,
-                   max_k: int) -> None:
-    print(f"  {name_a} vs {name_b} overlap per level "
-          f"(|A_k ∩ B_k| / 2^k):")
+def _level_overlap(name_a: str, a: np.ndarray, name_b: str, b: np.ndarray, max_k: int) -> None:
+    print(f"  {name_a} vs {name_b} overlap per level " f"(|A_k ∩ B_k| / 2^k):")
     print(f"    {'k':<4} {'2^k':>6} {'overlap':>8} {'pct':>6}")
     for k in range(1, max_k + 1):
-        sz = 2 ** k
+        sz = 2**k
         if sz > len(a) or sz > len(b):
             break
         sa, sb = set(a[:sz].tolist()), set(b[:sz].tolist())
@@ -90,9 +91,10 @@ def _level_overlap(name_a: str, a: np.ndarray, name_b: str, b: np.ndarray,
 # sep / cov replay (chunked, N×D + N memory)
 # ---------------------------------------------------------------------------
 
-def _replay_sep_cov(X: Tensor, sel: np.ndarray, max_k: int,
-                    chunk: int = 4096,
-                    use_float64: bool = True) -> List[Dict[str, float]]:
+
+def _replay_sep_cov(
+    X: Tensor, sel: np.ndarray, max_k: int, chunk: int = 4096, use_float64: bool = True
+) -> List[Dict[str, float]]:
     """Replay FPS along ``sel`` on X; record sep² and cov² at every 2^k boundary.
 
     cov_k² = max over unselected x of min squared distance to S_k.
@@ -135,7 +137,7 @@ def _replay_sep_cov(X: Tensor, sel: np.ndarray, max_k: int,
     out: List[Dict[str, float]] = []
 
     next_boundary = 2  # we record at sizes 2, 4, 8, ...
-    K = min(2 ** max_k, len(sel))
+    K = min(2**max_k, len(sel))
 
     sel_t = torch.as_tensor(sel[:K], dtype=torch.long, device=device)
 
@@ -155,19 +157,27 @@ def _replay_sep_cov(X: Tensor, sel: np.ndarray, max_k: int,
         hausdorff[new_idx] = -1.0
 
         if i + 1 == next_boundary:
-            cov_sq = float(hausdorff[hausdorff >= 0].max().item()) if (hausdorff >= 0).any() else 0.0
+            cov_sq = (
+                float(hausdorff[hausdorff >= 0].max().item()) if (hausdorff >= 0).any() else 0.0
+            )
             sep = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
             cov = math.sqrt(max(cov_sq, 0.0))
-            out.append({
-                "k": int(math.log2(next_boundary)),
-                "size": next_boundary,
-                "sep": sep,
-                "cov": cov,
-                "sep_sq": sep_sq if math.isfinite(sep_sq) else float("inf"),
-                "cov_sq": cov_sq,
-                "sep_gt_cov": sep > cov,
-                "rel_gap": (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf"),
-            })
+            out.append(
+                {
+                    "k": int(math.log2(next_boundary)),
+                    "size": next_boundary,
+                    "sep": sep,
+                    "cov": cov,
+                    "sep_sq": sep_sq if math.isfinite(sep_sq) else float("inf"),
+                    "cov_sq": cov_sq,
+                    "sep_gt_cov": sep > cov,
+                    "rel_gap": (
+                        (sep_sq / cov_sq - 1.0)
+                        if (cov_sq > 0 and math.isfinite(sep_sq))
+                        else float("inf")
+                    ),
+                }
+            )
             next_boundary *= 2
             if next_boundary > K:
                 break
@@ -195,17 +205,20 @@ def _print_sep_cov(name: str, rows: List[Dict[str, float]]) -> bool:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--py-single", type=str, default=None)
-    p.add_argument("--py-multi",  type=str, default=None)
+    p.add_argument("--py-multi", type=str, default=None)
     p.add_argument("--cu-single", type=str, default=None)
-    p.add_argument("--cu-multi",  type=str, default=None)
-    p.add_argument("--feats-A",   type=str, required=True,
-                   help="X_A features (.npy) — must match the run.")
-    p.add_argument("--feats-C",   type=str, required=True,
-                   help="X_C features (.npy) — must match the run.")
-    p.add_argument("--max-k",     type=int, default=14)
+    p.add_argument("--cu-multi", type=str, default=None)
+    p.add_argument(
+        "--feats-A", type=str, required=True, help="X_A features (.npy) — must match the run."
+    )
+    p.add_argument(
+        "--feats-C", type=str, required=True, help="X_C features (.npy) — must match the run."
+    )
+    p.add_argument("--max-k", type=int, default=14)
     return p.parse_args()
 
 
@@ -217,9 +230,9 @@ def main() -> int:
     print("=" * 70)
     runs = {
         "py_single": _load_indices(args.py_single),
-        "py_multi":  _load_indices(args.py_multi),
+        "py_multi": _load_indices(args.py_multi),
         "cu_single": _load_indices(args.cu_single),
-        "cu_multi":  _load_indices(args.cu_multi),
+        "cu_multi": _load_indices(args.cu_multi),
     }
     runs = {k: v for k, v in runs.items() if v is not None}
     if not runs:
@@ -235,12 +248,10 @@ def main() -> int:
     print("(a-b) single-GPU vs multi-GPU within each implementation")
     print("=" * 70)
     if "py_single" in runs and "py_multi" in runs:
-        if not _compare_exact("python_single", runs["py_single"],
-                              "python_multi",  runs["py_multi"]):
+        if not _compare_exact("python_single", runs["py_single"], "python_multi", runs["py_multi"]):
             fail_count += 1
     if "cu_single" in runs and "cu_multi" in runs:
-        if not _compare_exact("cuda_single", runs["cu_single"],
-                              "cuda_multi",  runs["cu_multi"]):
+        if not _compare_exact("cuda_single", runs["cu_single"], "cuda_multi", runs["cu_multi"]):
             fail_count += 1
 
     # ------------------------------------------------------------------
@@ -250,11 +261,11 @@ def main() -> int:
     print("(c) python vs CUDA overlap (informational; FP/tie-break drift expected)")
     print("=" * 70)
     if "py_single" in runs and "cu_single" in runs:
-        _level_overlap("python_single", runs["py_single"],
-                       "cuda_single",   runs["cu_single"], args.max_k)
+        _level_overlap(
+            "python_single", runs["py_single"], "cuda_single", runs["cu_single"], args.max_k
+        )
     elif "py_multi" in runs and "cu_multi" in runs:
-        _level_overlap("python_multi", runs["py_multi"],
-                       "cuda_multi",   runs["cu_multi"], args.max_k)
+        _level_overlap("python_multi", runs["py_multi"], "cuda_multi", runs["cu_multi"], args.max_k)
 
     # ------------------------------------------------------------------
     # (d) sep > cov per level for every loaded run

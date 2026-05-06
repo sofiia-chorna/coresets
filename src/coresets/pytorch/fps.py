@@ -17,9 +17,13 @@ from torch import Tensor
 
 @torch.jit.script
 def fps_update(
-    X: Tensor, norms: Tensor, d: Tensor,
-    hausdorff: Tensor, voronoi: Tensor,
-    new_idx: int, sel_idx: int,
+    X: Tensor,
+    norms: Tensor,
+    d: Tensor,
+    hausdorff: Tensor,
+    voronoi: Tensor,
+    new_idx: int,
+    sel_idx: int,
 ) -> None:
     """Single FPS step: compute distances from point new_idx, update state in-place.
 
@@ -154,9 +158,7 @@ def voronoi_fps(
         # Triangle-inequality bound: a point in cell j can only switch to
         # the new cell if dSL[j]/4 < hausdorff[x]. If no point qualifies,
         # skip the O(N*D) distance computation entirely.
-        dSL_quarter = (
-            norms_sel[:i] + norm_new - 2.0 * (X_sel[:i] @ x_new)
-        ) * 0.25
+        dSL_quarter = (norms_sel[:i] + norm_new - 2.0 * (X_sel[:i] @ x_new)) * 0.25
         active_mask = dSL_quarter[voronoi] < hausdorff
 
         if not active_mask.any():

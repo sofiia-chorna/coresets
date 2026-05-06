@@ -37,7 +37,9 @@ def run_benchmark(X_A, X_C, idx_A, max_k, profile):
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     result = accrete(
-        X_A_g, X_C_g, idx_A_g,
+        X_A_g,
+        X_C_g,
+        idx_A_g,
         max_k=max_k,
         profile=profile,
         verbose=True,
@@ -69,9 +71,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    X_A, X_C, idx_A, _ = load_data(
-        args.mad_feats, args.mad_fps, args.c_feats, args.c_fps
-    )
+    X_A, X_C, idx_A, _ = load_data(args.mad_feats, args.mad_fps, args.c_feats, args.c_fps)
     N_A = X_A.shape[0]
     N = N_A + X_C.shape[0]
     max_possible_k = int(torch.tensor(float(N)).log2().item())
@@ -89,8 +89,11 @@ def main():
     print("SINGLE-GPU CUDA accrete")
     print("=" * 60)
     indices, elapsed, peak_mem = run_benchmark(
-        X_A, X_C, idx_A,
-        args.max_k, args.profile,
+        X_A,
+        X_C,
+        idx_A,
+        args.max_k,
+        args.profile,
     )
 
     print()

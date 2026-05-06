@@ -7,8 +7,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-
-
 DEFAULT_MAX_K = 14
 
 
@@ -33,7 +31,12 @@ def parse_args():
     parser.add_argument("--c-feats", type=str)
     parser.add_argument("--c-fps", type=str)
     parser.add_argument("--max-k", type=int)
-    parser.add_argument("--out-dir", type=str, default=None, help="If set, save selected_ids.npz here (rank 0 only).")
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="If set, save selected_ids.npz here (rank 0 only).",
+    )
     return parser.parse_args()
 
 
@@ -49,8 +52,12 @@ def run_single_gpu(X_A, X_C, idx_A, idx_C, max_k):
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     result = accrete(
-        X_A_g, X_C_g, idx_A_g, idx_C_g,
-        max_k=max_k, verbose=True,
+        X_A_g,
+        X_C_g,
+        idx_A_g,
+        idx_C_g,
+        max_k=max_k,
+        verbose=True,
     )
     elapsed = time.perf_counter() - t0
     peak_mem = torch.cuda.max_memory_allocated() / 1e9
@@ -87,8 +94,13 @@ def run_multi_gpu(X_A, X_C, idx_A, N_A, max_k, rank, world_size):
     dist.barrier()
     t0 = time.perf_counter()
     result = accrete(
-        X_local, idx_A_g, N_A, rank, world_size,
-        max_k=max_k, verbose=True,
+        X_local,
+        idx_A_g,
+        N_A,
+        rank,
+        world_size,
+        max_k=max_k,
+        verbose=True,
     )
     dist.barrier()
     elapsed = time.perf_counter() - t0
@@ -108,6 +120,7 @@ def main():
 
     if distributed:
         import torch.distributed as dist
+
         torch.cuda.set_device(local_rank)
         try:
             dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
@@ -120,18 +133,14 @@ def main():
         world_size = 1
 
     # Load precomputed data (all ranks)
-    X_A, X_C, idx_A, idx_C = load_data(
-        args.mad_feats, args.mad_fps, args.c_feats, args.c_fps
-    )
+    X_A, X_C, idx_A, idx_C = load_data(args.mad_feats, args.mad_fps, args.c_feats, args.c_fps)
     N_A = X_A.shape[0]
     N = N_A + X_C.shape[0]
     max_possible_k = int(torch.tensor(float(N)).log2().item())
     max_k = args.max_k
 
     if max_k > max_possible_k:
-        raise ValueError(
-            f"--max-k={max_k} exceeds max possible k={max_possible_k} for N={N:,}"
-        )
+        raise ValueError(f"--max-k={max_k} exceeds max possible k={max_possible_k} for N={N:,}")
 
     if rank == 0:
         print(f"\nmax_k={max_k} (2^{max_k} = {2**max_k:,} points)")
@@ -148,11 +157,15 @@ def main():
         if args.out_dir:
             out = Path(args.out_dir)
             out.mkdir(parents=True, exist_ok=True)
-            np.savez(out / "indices.npz",
-                     selected_ids=result.numpy(),
-                     time_s=t_single,
-                     N_A=N_A, N=N, max_k=max_k,
-                     mode="python_single")
+            np.savez(
+                out / "indices.npz",
+                selected_ids=result.numpy(),
+                time_s=t_single,
+                N_A=N_A,
+                N=N,
+                max_k=max_k,
+                mode="python_single",
+            )
             print(f"Saved indices to {out}/indices.npz")
 
         print()
@@ -171,17 +184,28 @@ def main():
             print("=" * 60)
 
         result, t_multi, _ = run_multi_gpu(
-            X_A, X_C, idx_A, N_A, max_k, rank, world_size,
+            X_A,
+            X_C,
+            idx_A,
+            N_A,
+            max_k,
+            rank,
+            world_size,
         )
 
         if rank == 0 and args.out_dir:
             out = Path(args.out_dir)
             out.mkdir(parents=True, exist_ok=True)
-            np.savez(out / "indices.npz",
-                     selected_ids=result.numpy(),
-                     time_s=t_multi,
-                     N_A=N_A, N=N, max_k=max_k, world_size=world_size,
-                     mode="python_multi")
+            np.savez(
+                out / "indices.npz",
+                selected_ids=result.numpy(),
+                time_s=t_multi,
+                N_A=N_A,
+                N=N,
+                max_k=max_k,
+                world_size=world_size,
+                mode="python_multi",
+            )
             print(f"Saved indices to {out}/indices.npz")
 
         if rank == 0:

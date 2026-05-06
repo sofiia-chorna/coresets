@@ -51,17 +51,26 @@ def ensure_compiled() -> None:
                 "Load CUDA modules first (e.g. `module load cuda/12.5.1`)."
             ) from e
 
-    src_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels.cu")
-    if not os.path.isfile(src_file):
-        raise FileNotFoundError(f"kernels.cu not found at {src_file}")
+    here = os.path.dirname(os.path.abspath(__file__))
+    kernels_dir = os.path.join(here, "kernels")
+    sources = [
+        os.path.join(kernels_dir, fname)
+        for fname in ("warp.cu", "argmax.cu", "commit.cu", "simulate.cu", "multi.cu", "bindings.cu")
+    ]
+    missing = [s for s in sources if not os.path.isfile(s)]
+    if missing:
+        raise FileNotFoundError(
+            f"CUDA kernel sources missing: {missing}. " f"Expected under {kernels_dir}/."
+        )
 
     print("Compiling custom CUDA FPS kernels… (first time, ~15 s)")
     try:
         _extension = load(
             name="coreset_kernels",
-            sources=[src_file],
+            sources=sources,
             extra_cuda_cflags=["-O3", "--use_fast_math"],
             extra_cflags=["-O3"],
+            extra_include_paths=[kernels_dir],  # for "#include _shared.cuh"
             verbose=False,
         )
         _compiled = True
