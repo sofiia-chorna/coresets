@@ -1,0 +1,155 @@
++ ulimit -c 0
++ export CUDA_CACHE_DISABLE=1
++ CUDA_CACHE_DISABLE=1
++ export TRITON_HOME=/dev/shm/
++ TRITON_HOME=/dev/shm/
++ export OMP_NUM_THREADS=14
++ OMP_NUM_THREADS=14
++ export MPICH_GPU_SUPPORT_ENABLED=0
++ MPICH_GPU_SUPPORT_ENABLED=0
++ export TORCH_CUDA_ARCH_LIST=9.0
++ TORCH_CUDA_ARCH_LIST=9.0
++ REPO_NEW=/capstor/scratch/cscs/schorna/merge-datasets/coresets
++ REPO_OLD=/capstor/scratch/cscs/schorna/merge-datasets/accrete_experiments
++ DATA=/capstor/scratch/cscs/schorna/merge-datasets/data
++ MAX_K=14
++ MAD_FEATS=/capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy
++ MAD_FPS=/capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/fps_mad-s-v1.5.0_ll_mean_scaled.npz
++ C_FEATS=/capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy
++ C_FPS=/capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/fps_matpes_s-v1.5.0_ll_mean_scaled.npz
++ WORK=/dev/shm/parity_3374657
++ OUT_OLD=/dev/shm/parity_3374657/old_accexp
++ OUT_NEW=/dev/shm/parity_3374657/new_coresets
++ EXT_OLD=/dev/shm/parity_3374657/torch_ext_old
++ EXT_NEW=/dev/shm/parity_3374657/torch_ext_new
++ mkdir -p /dev/shm/parity_3374657/old_accexp /dev/shm/parity_3374657/new_coresets /dev/shm/parity_3374657/torch_ext_old /dev/shm/parity_3374657/torch_ext_new
+++ date
++ echo 'STARTING Thu May  7 04:32:20 PM CEST 2026'
+STARTING Thu May  7 04:32:20 PM CEST 2026
++ echo 'max_k=14  data: /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy + /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy'
+max_k=14  data: /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy + /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy
++ echo '=== Phase 1: accrete_experiments/benchmark_cuda.py ==='
+=== Phase 1: accrete_experiments/benchmark_cuda.py ===
++ srun -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export TORCH_EXTENSIONS_DIR=/dev/shm/parity_3374657/torch_ext_old
+    cd /capstor/scratch/cscs/schorna/merge-datasets/accrete_experiments
+    python3 benchmarks/benchmark_cuda.py       --mad-feats /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy       --mad-fps   /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/fps_mad-s-v1.5.0_ll_mean_scaled.npz       --c-feats   /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy       --c-fps     /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/fps_matpes_s-v1.5.0_ll_mean_scaled.npz       --max-k     14       --out-dir   /dev/shm/parity_3374657/old_accexp
+'
+0: Device: cuda
+0: Loading data ...
+0:   A (MAD): torch.Size([216803, 512]), FPS: torch.Size([216803])
+0:   C: torch.Size([434712, 512]), FPS: torch.Size([434712])
+0:   Union: 651,515 x 512
+0: 
+0: max_k=14 (2^14 = 16,384 points)
+0: max possible k = 19 (2^19 = 524,288)
+0: 
+0: ============================================================
+0: SINGLE-GPU CUDA accrete
+0: ============================================================
+0: Compiling custom CUDA FPS kernels… (first time, ~15 s)
+0: Compilation finished. Kernel loaded.
+0: k    | size       |      in_Bk |     from_A |     from_C |    time_s |       sep |       cov |     rel_gap
+0: --------------------------------------------------------------------------------------------------------
+0: 1    | 2          |          2 |          2 |          0 |      0.11 |   6.91263 |   3.94606 |   2.069e+00
+0: 2    | 4          |          4 |          4 |          0 |      0.12 |   3.30067 |   3.03230 |   1.848e-01
+0: 3    | 8          |          8 |          8 |          0 |      0.06 |   2.43857 |   2.23109 |   1.946e-01
+0: 4    | 16         |         15 |         15 |          1 |      0.05 |   1.84203 |   1.82819 |   1.520e-02
+0: 5    | 32         |         30 |         30 |          2 |      0.05 |   1.37496 |   1.32903 |   7.032e-02
+0: 6    | 64         |         61 |         61 |          3 |      0.07 |   1.10103 |   1.10032 |   1.288e-03
+0: 7    | 128        |        122 |        123 |          5 |      0.12 |   0.87388 |   0.87375 |   3.004e-04
+0: 8    | 256        |        243 |        247 |          9 |      0.23 |   0.71064 |   0.71016 |   1.354e-03
+0: 9    | 512        |        483 |        495 |         17 |      0.29 |   0.58349 |   0.58349 |   2.276e-06
+0: 10   | 1024       |        960 |        985 |         39 |      0.51 |   0.48422 |   0.48413 |   3.708e-04
+0: 11   | 2048       |       1905 |       1962 |         86 |      0.90 |   0.40309 |   0.40305 |   1.937e-04
+0: 12   | 4096       |       3757 |       3880 |        216 |      1.92 |   0.33342 |   0.33342 |   1.180e-05
+0: 13   | 8192       |       7412 |       7586 |        606 |      3.71 |   0.27250 |   0.27248 |   7.867e-05
+0: 14   | 16384      |      14456 |      14703 |       1681 |      6.93 |   0.21566 |   0.21566 |   4.357e-05
+0: 
+0: Time: 15.2s (0.3 min)
+0: Peak GPU memory: 4.02 GB
+0: Result: 16,384 points
+0: 
+0: ============================================================
+0: ETA for larger max_k
+0: ============================================================
+0:   k=15  size=    32,768  est ~1 min (0.0 h)
+0:   k=16  size=    65,536  est ~1 min (0.0 h)
+0:   k=17  size=   131,072  est ~2 min (0.0 h)
+0:   k=18  size=   262,144  est ~4 min (0.1 h)
+0:   k=19  size=   524,288  est ~8 min (0.1 h)
+0: 
+0: Saved to /dev/shm/parity_3374657/old_accexp/
++ echo '=== Phase 2: coresets/benchmark_cuda.py ==='
+=== Phase 2: coresets/benchmark_cuda.py ===
++ srun -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export TORCH_EXTENSIONS_DIR=/dev/shm/parity_3374657/torch_ext_new
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    python3 benchmarks/benchmark_cuda.py       --mad-feats /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy       --mad-fps   /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/fps_mad-s-v1.5.0_ll_mean_scaled.npz       --c-feats   /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy       --c-fps     /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/fps_matpes_s-v1.5.0_ll_mean_scaled.npz       --max-k     14       --out-dir   /dev/shm/parity_3374657/new_coresets
+'
+0: Device: cuda
+0: Loading data ...
+0:   A (MAD): torch.Size([216803, 512]), FPS: torch.Size([216803])
+0:   C: torch.Size([434712, 512]), FPS: torch.Size([434712])
+0:   Union: 651,515 x 512
+0: 
+0: max_k=14 (2^14 = 16,384 points)
+0: max possible k = 19 (2^19 = 524,288)
+0: 
+0: ============================================================
+0: SINGLE-GPU CUDA accrete
+0: ============================================================
+0: Compiling custom CUDA FPS kernels… (first time, ~15 s)
+0: Compilation finished. Kernel loaded.
+0: k    | size       |      in_Bk |     from_A |     from_C |    time_s |       sep |       cov |     rel_gap
+0: --------------------------------------------------------------------------------------------------------
+0: 1    | 2          |          2 |          2 |          0 |      0.03 |   6.91263 |   3.94606 |   2.069e+00
+0: 2    | 4          |          4 |          4 |          0 |      0.04 |   3.30067 |   3.03230 |   1.848e-01
+0: 3    | 8          |          8 |          8 |          0 |      0.02 |   2.43857 |   2.23109 |   1.946e-01
+0: 4    | 16         |         15 |         15 |          1 |      0.05 |   1.84203 |   1.82819 |   1.520e-02
+0: 5    | 32         |         30 |         30 |          2 |      0.05 |   1.37496 |   1.32903 |   7.032e-02
+0: 6    | 64         |         61 |         61 |          3 |      0.07 |   1.10103 |   1.10032 |   1.288e-03
+0: 7    | 128        |        122 |        123 |          5 |      0.11 |   0.87388 |   0.87375 |   3.004e-04
+0: 8    | 256        |        243 |        247 |          9 |      0.20 |   0.71064 |   0.71016 |   1.354e-03
+0: 9    | 512        |        483 |        495 |         17 |      0.28 |   0.58349 |   0.58349 |   2.276e-06
+0: 10   | 1024       |        960 |        985 |         39 |      0.50 |   0.48422 |   0.48413 |   3.708e-04
+0: 11   | 2048       |       1905 |       1962 |         86 |      0.89 |   0.40309 |   0.40305 |   1.937e-04
+0: 12   | 4096       |       3757 |       3880 |        216 |      1.91 |   0.33342 |   0.33342 |   1.180e-05
+0: 13   | 8192       |       7412 |       7586 |        606 |      3.68 |   0.27250 |   0.27248 |   7.867e-05
+0: 14   | 16384      |      14456 |      14703 |       1681 |      6.77 |   0.21566 |   0.21566 |   4.357e-05
+0: 
+0: Time: 14.6s (0.2 min)
+0: Peak GPU memory: 4.02 GB
+0: Result: 16,384 points
+0: 
+0: ============================================================
+0: ETA for larger max_k
+0: ============================================================
+0:   k=15  size=    32,768  est ~0 min (0.0 h)
+0:   k=16  size=    65,536  est ~1 min (0.0 h)
+0:   k=17  size=   131,072  est ~2 min (0.0 h)
+0:   k=18  size=   262,144  est ~4 min (0.1 h)
+0:   k=19  size=   524,288  est ~8 min (0.1 h)
+0: 
+0: Saved to /dev/shm/parity_3374657/new_coresets/
++ echo '=== Phase 3: parity check ==='
+=== Phase 3: parity check ===
++ python3 -
+  old: 16,384 ids, 15.2s, peak 4.02 GB
+  new: 16,384 ids, 14.6s, peak 4.02 GB
+  OK    selected_ids byte-identical (16,384 indices)
+  timing: Δ = -0.5s (-3.5%)
+  OK    wall-time within ±5%
+  peak mem: Δ = +0.002 GB (+0.06%)
+  OK    peak memory within ±1%
+ALL CHECKS PASSED.
++ PARITY_EXIT=0
++ '[' 0 -eq 0 ']'
++ rm -rf /dev/shm/parity_3374657
+++ date
++ echo 'ENDING Thu May  7 04:34:53 PM CEST 2026'
+ENDING Thu May  7 04:34:53 PM CEST 2026
++ exit 0
