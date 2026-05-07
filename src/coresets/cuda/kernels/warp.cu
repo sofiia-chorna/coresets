@@ -1,34 +1,6 @@
 // kernels/warp.cu — dense + Voronoi-skip Hausdorff-update kernels.
+// warp_dot helper lives in _shared.cuh (visible across translation units).
 #include "_shared.cuh"
-
-// One warp dot-products row_ptr · x_new_smem (D coords). Lane k handles
-// every 32nd coord; caller reduces the 32 partials. Float4 fast-path on
-// D%4==0. __ldg routes the global load through the read-only cache.
-template <typename scalar_t>
-__device__ __forceinline__ float warp_dot(const scalar_t* __restrict__ row_ptr,
-                                          const scalar_t* __restrict__ x_new_smem,  // shared mem
-                                          int D, int lane) {
-    float dot = 0.0f;
-    if constexpr (std::is_same<scalar_t, float>::value) {
-        if (D % 4 == 0) {
-            const float4* rp4 = reinterpret_cast<const float4*>(row_ptr);
-            const float4* xn4 = reinterpret_cast<const float4*>(x_new_smem);
-            for (int i = lane; i < D / 4; i += 32) {
-                float4 a = __ldg(&rp4[i]);
-                float4 b = xn4[i];
-                dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
-            }
-        } else {
-            for (int i = lane; i < D; i += 32)
-                dot += __ldg(&row_ptr[i]) * x_new_smem[i];
-        }
-    } else {
-        // float16 inputs, float32 accumulator (C2).
-        for (int i = lane; i < D; i += 32)
-            dot += (float) row_ptr[i] * (float) x_new_smem[i];
-    }
-    return dot;
-}
 
 // Dense Hausdorff update: recompute d² for every row, tighten h/voronoi.
 // Used at step 0 and as the fallback when no Voronoi skip is set up.

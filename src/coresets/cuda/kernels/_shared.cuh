@@ -1,9 +1,12 @@
 #pragma once
 
 // Common header for the split CUDA extension. Holds includes, constants,
-// and forward declarations of every C++ wrapper — lets the .cu files call
-// each other across translation-unit boundaries. Templates and __device__
-// helpers stay in their own .cu (instantiated via AT_DISPATCH at the call site).
+// forward declarations of every C++ wrapper, and the small __device__
+// template helpers shared across .cu files. CUDA cannot link __device__
+// templates across translation units, so they MUST live here as
+// `static __device__ __forceinline__` (each .cu gets its own copy).
+// Per-kernel templates that are dispatched via AT_DISPATCH at the call
+// site stay in their own .cu.
 
 #include <torch/extension.h>
 #include <pybind11/stl.h>
@@ -20,8 +23,45 @@
 static const int MAX_ARGMAX_BLOCKS = 1024;
 static const int ARGMAX_THREADS = 256;
 
-// ------------ Forward declarations of C++ wrappers ------------
+// ------------ Shared __device__ template helpers ------------
 
+// Tie-break: strictly greater value wins; on equal values, smaller index wins.
+// Used by argmax kernels (single-GPU) and the multi-GPU gather-buf reductions.
+template <typename idx_t>
+static __device__ __forceinline__ bool argmax_better(float v_a, idx_t i_a, float v_b, idx_t i_b) {
+    return (v_a > v_b) || (v_a == v_b && i_a < i_b);
+}
+
+// One warp dot-products row_ptr · x_new_smem (D coords). Lane k handles
+// every 32nd coord; caller reduces the 32 partials. Float4 fast-path on
+// D%4==0. __ldg routes the global load through the read-only cache.
+template <typename scalar_t>
+static __device__ __forceinline__ float warp_dot(const scalar_t* __restrict__ row_ptr,
+                                                 const scalar_t* __restrict__ x_new_smem, int D,
+                                                 int lane) {
+    float dot = 0.0f;
+    if constexpr (std::is_same<scalar_t, float>::value) {
+        if (D % 4 == 0) {
+            const float4* rp4 = reinterpret_cast<const float4*>(row_ptr);
+            const float4* xn4 = reinterpret_cast<const float4*>(x_new_smem);
+            for (int i = lane; i < D / 4; i += 32) {
+                float4 a = __ldg(&rp4[i]);
+                float4 b = xn4[i];
+                dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        } else {
+            for (int i = lane; i < D; i += 32)
+                dot += __ldg(&row_ptr[i]) * x_new_smem[i];
+        }
+    } else {
+        // float16 inputs, float32 accumulator (C2).
+        for (int i = lane; i < D; i += 32)
+            dot += (float) row_ptr[i] * (float) x_new_smem[i];
+    }
+    return dot;
+}
+
+// ------------ Forward declarations of C++ wrappers ------------
 // warp.cu
 void fps_update_cuda(torch::Tensor X, torch::Tensor norms, torch::Tensor x_new,
                      torch::Tensor hausdorff, torch::Tensor voronoi, torch::Tensor norm_new_t,
@@ -39,7 +79,7 @@ void max_val_cuda(torch::Tensor h, torch::Tensor block_vals, int64_t N, torch::T
 
 __global__ void final_viable_check_kernel(const float* d_max_h, const float* d_local_sep,
                                           int* d_viable);
-__global__ void final_viable_check_multi_kernel(const float* d_global_max_h,
+__global__ void final_viable_check_multi_kernel(const float* gather_buf, const int world_size,
                                                 const float* d_local_sep, int* d_viable);
 
 // commit.cu

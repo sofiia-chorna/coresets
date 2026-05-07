@@ -1,4 +1,5 @@
 // kernels/argmax.cu — two-phase argmax with deterministic tie-break.
+// argmax_better helper lives in _shared.cuh (visible across translation units).
 #include "_shared.cuh"
 
 // Determinism: naive parallel argmax is non-deterministic on ties — launch
@@ -8,12 +9,6 @@
 // byte-identity. Does NOT match torch.argmax bitwise — cuBLAS GEMV has a
 // different FP reduction order, so the distances themselves disagree in
 // the last bit, which a tie-break can't paper over.
-
-// Tie-break: strictly greater value wins; on equal values, smaller index wins.
-template <typename idx_t>
-__device__ __forceinline__ bool argmax_better(float v_a, idx_t i_a, float v_b, idx_t i_b) {
-    return (v_a > v_b) || (v_a == v_b && i_a < i_b);
-}
 
 template <typename scalar_t>
 __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __restrict__ block_vals,
