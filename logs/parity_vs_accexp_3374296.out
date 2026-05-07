@@ -1,0 +1,333 @@
++ ulimit -c 0
++ export CUDA_CACHE_DISABLE=1
++ CUDA_CACHE_DISABLE=1
++ export TRITON_HOME=/dev/shm/
++ TRITON_HOME=/dev/shm/
++ export OMP_NUM_THREADS=14
++ OMP_NUM_THREADS=14
++ export MPICH_GPU_SUPPORT_ENABLED=0
++ MPICH_GPU_SUPPORT_ENABLED=0
++ export TORCH_CUDA_ARCH_LIST=9.0
++ TORCH_CUDA_ARCH_LIST=9.0
++ REPO_NEW=/capstor/scratch/cscs/schorna/merge-datasets/coresets
++ REPO_OLD=/capstor/scratch/cscs/schorna/merge-datasets/accrete_experiments
++ DATA=/capstor/scratch/cscs/schorna/merge-datasets/data
++ MAX_K=14
++ MAD_FEATS=/capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy
++ MAD_FPS=/capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/fps_mad-s-v1.5.0_ll_mean_scaled.npz
++ C_FEATS=/capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy
++ C_FPS=/capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/fps_matpes_s-v1.5.0_ll_mean_scaled.npz
++ WORK=/dev/shm/parity_3374296
++ OUT_OLD=/dev/shm/parity_3374296/old_accexp
++ OUT_NEW=/dev/shm/parity_3374296/new_coresets
++ EXT_OLD=/dev/shm/parity_3374296/torch_ext_old
++ EXT_NEW=/dev/shm/parity_3374296/torch_ext_new
++ mkdir -p /dev/shm/parity_3374296/old_accexp /dev/shm/parity_3374296/new_coresets /dev/shm/parity_3374296/torch_ext_old /dev/shm/parity_3374296/torch_ext_new
+++ date
++ echo 'STARTING Thu May  7 04:10:50 PM CEST 2026'
+STARTING Thu May  7 04:10:50 PM CEST 2026
++ echo 'max_k=14  data: /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy + /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy'
+max_k=14  data: /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy + /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy
++ echo '=== Phase 1: accrete_experiments/benchmark_cuda.py ==='
+=== Phase 1: accrete_experiments/benchmark_cuda.py ===
++ srun -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export TORCH_EXTENSIONS_DIR=/dev/shm/parity_3374296/torch_ext_old
+    cd /capstor/scratch/cscs/schorna/merge-datasets/accrete_experiments
+    python3 benchmarks/benchmark_cuda.py       --mad-feats /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy       --mad-fps   /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/fps_mad-s-v1.5.0_ll_mean_scaled.npz       --c-feats   /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy       --c-fps     /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/fps_matpes_s-v1.5.0_ll_mean_scaled.npz       --max-k     14       --out-dir   /dev/shm/parity_3374296/old_accexp
+'
+0: Device: cuda
+0: Loading data ...
+0:   A (MAD): torch.Size([216803, 512]), FPS: torch.Size([216803])
+0:   C: torch.Size([434712, 512]), FPS: torch.Size([434712])
+0:   Union: 651,515 x 512
+0: 
+0: max_k=14 (2^14 = 16,384 points)
+0: max possible k = 19 (2^19 = 524,288)
+0: 
+0: ============================================================
+0: SINGLE-GPU CUDA accrete
+0: ============================================================
+0: Compiling custom CUDA FPS kernels… (first time, ~15 s)
+0: Compilation finished. Kernel loaded.
+0: k    | size       |      in_Bk |     from_A |     from_C |    time_s |       sep |       cov |     rel_gap
+0: --------------------------------------------------------------------------------------------------------
+0: 1    | 2          |          2 |          2 |          0 |      0.11 |   6.91263 |   3.94606 |   2.069e+00
+0: 2    | 4          |          4 |          4 |          0 |      0.12 |   3.30067 |   3.03230 |   1.848e-01
+0: 3    | 8          |          8 |          8 |          0 |      0.06 |   2.43857 |   2.23109 |   1.946e-01
+0: 4    | 16         |         15 |         15 |          1 |      0.05 |   1.84203 |   1.82819 |   1.520e-02
+0: 5    | 32         |         30 |         30 |          2 |      0.07 |   1.37496 |   1.32903 |   7.032e-02
+0: 6    | 64         |         61 |         61 |          3 |      0.07 |   1.10103 |   1.10032 |   1.288e-03
+0: 7    | 128        |        122 |        123 |          5 |      0.12 |   0.87388 |   0.87375 |   3.004e-04
+0: 8    | 256        |        243 |        247 |          9 |      0.23 |   0.71064 |   0.71016 |   1.354e-03
+0: 9    | 512        |        483 |        495 |         17 |      0.29 |   0.58349 |   0.58349 |   2.276e-06
+0: 10   | 1024       |        960 |        985 |         39 |      0.51 |   0.48422 |   0.48413 |   3.708e-04
+0: 11   | 2048       |       1905 |       1962 |         86 |      0.90 |   0.40309 |   0.40305 |   1.937e-04
+0: 12   | 4096       |       3757 |       3880 |        216 |      1.93 |   0.33342 |   0.33342 |   1.180e-05
+0: 13   | 8192       |       7412 |       7586 |        606 |      3.73 |   0.27250 |   0.27248 |   7.867e-05
+0: 14   | 16384      |      14456 |      14703 |       1681 |      6.94 |   0.21566 |   0.21566 |   4.357e-05
+0: 
+0: Time: 15.2s (0.3 min)
+0: Peak GPU memory: 4.02 GB
+0: Result: 16,384 points
+0: 
+0: ============================================================
+0: ETA for larger max_k
+0: ============================================================
+0:   k=15  size=    32,768  est ~1 min (0.0 h)
+0:   k=16  size=    65,536  est ~1 min (0.0 h)
+0:   k=17  size=   131,072  est ~2 min (0.0 h)
+0:   k=18  size=   262,144  est ~4 min (0.1 h)
+0:   k=19  size=   524,288  est ~8 min (0.1 h)
+0: 
+0: Saved to /dev/shm/parity_3374296/old_accexp/
++ echo '=== Phase 2: coresets/benchmark_cuda.py ==='
+=== Phase 2: coresets/benchmark_cuda.py ===
++ srun -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export TORCH_EXTENSIONS_DIR=/dev/shm/parity_3374296/torch_ext_new
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    python3 benchmarks/benchmark_cuda.py       --mad-feats /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/mad-s-v1.5.0_ll_mean_scaled.npy       --mad-fps   /capstor/scratch/cscs/schorna/merge-datasets/data/mad-1.5/pet/fps_mad-s-v1.5.0_ll_mean_scaled.npz       --c-feats   /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/matpes_s-v1.5.0_ll_mean_scaled.npy       --c-fps     /capstor/scratch/cscs/schorna/merge-datasets/data/matpes/pet/fps_matpes_s-v1.5.0_ll_mean_scaled.npz       --max-k     14       --out-dir   /dev/shm/parity_3374296/new_coresets
+'
+0: Device: cuda
+0: Loading data ...
+0:   A (MAD): torch.Size([216803, 512]), FPS: torch.Size([216803])
+0:   C: torch.Size([434712, 512]), FPS: torch.Size([434712])
+0:   Union: 651,515 x 512
+0: 
+0: max_k=14 (2^14 = 16,384 points)
+0: max possible k = 19 (2^19 = 524,288)
+0: 
+0: ============================================================
+0: SINGLE-GPU CUDA accrete
+0: ============================================================
+0: Compiling custom CUDA FPS kernels… (first time, ~15 s)
+0: Traceback (most recent call last):
+0:   File "/user-environment/env/default/lib/python3.12/site-packages/torch/utils/cpp_extension.py", line 2597, in _run_ninja_build
+0:     subprocess.run(
+0:   File "/user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/lib/python3.12/subprocess.py", line 571, in run
+0:     raise CalledProcessError(retcode, process.args,
+0: subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.
+0: 
+0: The above exception was the direct cause of the following exception:
+0: 
+0: Traceback (most recent call last):
+0:   File "/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/ext.py", line 63, in ensure_compiled
+0:     _extension = load(
+0:                  ^^^^^
+0:   File "/user-environment/env/default/lib/python3.12/site-packages/torch/utils/cpp_extension.py", line 1692, in load
+0:     return _jit_compile(
+0:            ^^^^^^^^^^^^^
+0:   File "/user-environment/env/default/lib/python3.12/site-packages/torch/utils/cpp_extension.py", line 2134, in _jit_compile
+0:     _write_ninja_file_and_build_library(
+0:   File "/user-environment/env/default/lib/python3.12/site-packages/torch/utils/cpp_extension.py", line 2286, in _write_ninja_file_and_build_library
+0:     _run_ninja_build(
+0:   File "/user-environment/env/default/lib/python3.12/site-packages/torch/utils/cpp_extension.py", line 2614, in _run_ninja_build
+0:     raise RuntimeError(message) from e
+0: RuntimeError: Error building extension 'coreset_kernels': [1/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output multi.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu -o multi.cud
+0: a.o 
+0: FAILED: [code=2] multi.cuda.o 
+0: /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output multi.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu -o multi.cuda.o 
+0: /capstor/scratch/cscs/s
+0: chorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(63): error: identifier "argmax_better" is undefined
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                   ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(63): error: type name is not allowed
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(63): warning #174-D: expression has no effect
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                          ^
+0: 
+0: Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(238): error: argument of type "int" is incompatible with parameter of type "const float *"
+0:       final_viable_check_multi_kernel<<<1, 1>>>(argmax_gather_buf.data_ptr<f
+0: loat>(), (int) world_size,
+0:                                                                                      ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(239): error: argument of type "float *" is incompatible with parameter of type "int *"
+0:                                                 d_local_sep.data_ptr<float>(),
+0:                                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(240): error: too many arguments in function call
+0:                                                 d_viable.data_ptr<int>());
+0:                                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(333): error: identifier "argmax_better" is undefined
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                   ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(333): error: type
+0:  name is not allowed
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(333): warning #174-D: expression has no effect
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                          ^
+0: 
+0: 7 errors detected in the compilation of "/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu".
+0: [2/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output commit.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /u
+0: ser-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu -o commit.cuda.o 
+0: FAILED: [code=1] commit.cuda.o 
+0: /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output commit.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-ne
+0: overse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu -o commit.cuda.o 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(76): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_kernel(const scalar_t *, const float *, float *, int, int) [with scalar_t=double]" at line 180
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(76): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D,
+0:  shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_kernel(const scalar_t *, const float *, float *, int, int) [with scalar_t=float]" at line 180
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(76): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_kernel(const scalar_t *, const float *, float *, int, int) [with scalar_t=c10::Half]" at line 180
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(125): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_masked_kernel(const scalar_t *, const float *, float *, const int *, int, int) [with scalar_t=double]" at l
+0: ine 209
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(125): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_masked_kernel(const scalar_t *, const float *, float *, const int *, int, int) [with scalar_t=float]" at line 209
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(125): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_masked_kernel(const scalar_t *, const float *, float *, const int *, int, int) [with scalar_t=c10::Half]" at line 209
+0: 
+0: 6 errors detected in the compilation of "/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu".
+0: [3/7] /user-environment/env/default/bi
+0: n/nvcc --generate-dependencies-with-compile --dependency-output simulate.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/simulate.cu -o simulate.cuda.o 
+0: [4/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile 
+0: --dependency-output argmax.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/argmax.cu -o argmax.cuda.o 
+0: [5/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output warp.cuda.o.d -DTORCH_EXTENSIO
+0: N_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/warp.cu -o warp.cuda.o 
+0: [6/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output bindings.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION
+0: _H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/bindings.cu -o bindings.cuda.o 
+0: ninja: build stopped: subcommand failed.
+0: 
+0: 
+0: The above exception was the direct cause of the following exception:
+0: 
+0: Traceback (most recent call last):
+0:   File "/capstor/scratch/cscs/schorna/merge-datasets/coresets/benchmarks/benchmark_c
+0: uda.py", line 127, in <module>
+0:     main()
+0:   File "/capstor/scratch/cscs/schorna/merge-datasets/coresets/benchmarks/benchmark_cuda.py", line 91, in main
+0:     indices, elapsed, peak_mem = run_benchmark(
+0:                                  ^^^^^^^^^^^^^^
+0:   File "/capstor/scratch/cscs/schorna/merge-datasets/coresets/benchmarks/benchmark_cuda.py", line 35, in run_benchmark
+0:     warmup_fast_fps()
+0:   File "/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/ext.py", line 88, in warmup_fast_fps
+0:     ensure_compiled()
+0:   File "/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/ext.py", line 74, in ensure_compiled
+0:     raise RuntimeError(
+0: RuntimeError: Failed to compile CUDA kernels: Error building extension 'coreset_kernels': [1/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output multi.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/
+0: coresets/src/coresets/cuda/kernels/multi.cu -o multi.cuda.o 
+0: FAILED: [code=2] multi.cuda.o 
+0: /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output multi.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/k
+0: ernels/multi.cu -o multi.cuda.o 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(63): error: identifier "argmax_better" is undefined
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                   ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(63): error: type name is not allowed
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(63): warning #174-D: expression has no effect
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                          ^
+0: 
+0: Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(238): error: argument of type "int" is incompatible with parameter of type "const float *"
+0:       final_viable_c
+0: heck_multi_kernel<<<1, 1>>>(argmax_gather_buf.data_ptr<float>(), (int) world_size,
+0:                                                                                      ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(239): error: argument of type "float *" is incompatible with parameter of type "int *"
+0:                                                 d_local_sep.data_ptr<float>(),
+0:                                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(240): error: too many arguments in function call
+0:                                                 d_viable.data_ptr<int>());
+0:                                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(333): error: identifier "argmax_better" is undefined
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                   ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/cores
+0: ets/src/coresets/cuda/kernels/multi.cu(333): error: type name is not allowed
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                 ^
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu(333): warning #174-D: expression has no effect
+0:               if (argmax_better<int64_t>(v, i, best_val, best_idx)) {
+0:                                          ^
+0: 
+0: 7 errors detected in the compilation of "/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/multi.cu".
+0: [2/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output commit.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -i
+0: system /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu -o commit.cuda.o 
+0: FAILED: [code=1] commit.cuda.o 
+0: /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output commit.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment
+0: /env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu -o commit.cuda.o 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(76): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_kernel(const scalar_t *, const float *, float *, int, int) [with scalar_t=double]" at line 180
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(76): error: identifier "warp_dot" is undefin
+0: ed
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_kernel(const scalar_t *, const float *, float *, int, int) [with scalar_t=float]" at line 180
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(76): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_kernel(const scalar_t *, const float *, float *, int, int) [with scalar_t=c10::Half]" at line 180
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(125): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_masked_kernel(const scalar_t *, const float *, floa
+0: t *, const int *, int, int) [with scalar_t=double]" at line 209
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(125): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_masked_kernel(const scalar_t *, const float *, float *, const int *, int, int) [with scalar_t=float]" at line 209
+0: 
+0: /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/commit.cu(125): error: identifier "warp_dot" is undefined
+0:       float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
+0:                   ^
+0:           detected during instantiation of "void compute_dSL_quarter_masked_kernel(const scalar_t *, const float *, float *, const int *, int, int) [with scalar_t=c10::Half]" at line 209
+0: 
+0: 6 errors detected in the compilation of "/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/ke
+0: rnels/commit.cu".
+0: [3/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output simulate.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/simulate.cu -o simulate.cuda.o 
+0: [4/7] /user-environment/en
+0: v/default/bin/nvcc --generate-dependencies-with-compile --dependency-output argmax.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/argmax.cu -o argmax.cuda.o 
+0: [5/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-co
+0: mpile --dependency-output warp.cuda.o.d -DTORCH_EXTENSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/warp.cu -o warp.cuda.o 
+0: [6/7] /user-environment/env/default/bin/nvcc --generate-dependencies-with-compile --dependency-output bindings.cuda.o.d -DTORCH_EXTE
+0: NSION_NAME=coreset_kernels -DTORCH_API_INCLUDE_EXTENSION_H -I/capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include -isystem /user-environment/env/default/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /user-environment/env/default/include -isystem /user-environment/linux-neoverse_v2/python-3.12.12-qkuq2b5a5leq2y53xp7sybd6ksqtfdmh/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90a,code=sm_90a --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /capstor/scratch/cscs/schorna/merge-datasets/coresets/src/coresets/cuda/kernels/bindings.cu -o bindings.cuda.o 
+0: ninja: build stopped: subcommand failed.
+0: . CUDA_HOME=/user-environment/env/default
+srun: error: nid006023: task 0: Exited with exit code 1
+srun: Terminating StepId=3374296.1
