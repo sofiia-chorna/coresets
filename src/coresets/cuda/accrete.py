@@ -1,21 +1,18 @@
-"""Single-GPU Voronoi-accelerated FPS-accretion coreset.
-
-Public entry point for the production CUDA single-GPU path.
-Multi-GPU sharded usage lives in :mod:`coresets.cuda.multi.sharded`.
-"""
+"""Single-GPU FPS-accretion. Public entry point for the production CUDA path."""
 
 from __future__ import annotations
 
 import math
 import time
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 import torch
 from torch import Tensor
 
-from .ext import ensure_compiled, get_ext
-from ._voronoi_step import voronoi_step
 from ._bisect import bisect_voronoi_fast
+from ._diag import PhaseTimer, Tracer
+from ._voronoi_step import voronoi_step
+from .ext import ensure_compiled, get_ext
 
 
 def accrete(
@@ -32,119 +29,69 @@ def accrete(
 
     Parameters
     ----------
-    X_anchor : Tensor (n_anchor, D), float32 on CUDA
-        Features of the *anchor* subset — the points whose hierarchy is
-        preserved by construction at every level k where ``2^k <= n_anchor``.
-    X_candidates : Tensor (n_candidates, D), float32 on CUDA
-        Features of the *candidate* pool — points eligible to fill higher
-        levels. Use an empty tensor with shape ``(0, D)`` if there are none.
-    anchor_order : Tensor (n_anchor,), int64
-        FPS hierarchy of the anchor (indices into ``X_anchor``). The first
+    X_anchor : (n_anchor, D) float32 CUDA
+        Anchor features. Their FPS hierarchy is preserved by construction at
+        every level k where ``2^k <= n_anchor``.
+    X_candidates : (n_candidates, D) float32 CUDA
+        Candidate pool (eligible to fill higher levels). Pass an empty
+        ``(0, D)`` tensor if there are none.
+    anchor_order : (n_anchor,) int64
+        FPS hierarchy of the anchor (indices into ``X_anchor``); the first
         ``2^k`` entries form the anchor block at level k.
     max_k : int, optional
-        Final coreset size = ``2 ** max_k``. If ``None``, auto-derived
-        from free GPU memory; pin explicitly in production.
-    verbose : bool
-        Per-level progress print.
-    profile : bool
-        Phase-level timing breakdown at end of run.
-    trace_path : str, optional
-        Diagnostic trace file used by determinism tests.
+        Final coreset size = ``2 ** max_k``. Auto-derived from free memory if
+        ``None`` — pin explicitly in production.
+    verbose : per-level progress print.
+    profile : phase-level timing breakdown at end of run.
+    trace_path : diagnostic trace file used by the determinism tests.
 
     Returns
     -------
-    Tensor (``2 ** max_k``,), int64
-        Coreset indices in the union ``cat([X_anchor, X_candidates])``
-        index space (entries < ``n_anchor`` came from the anchor).
+    (2 ** max_k,) int64
+        Coreset indices into ``cat([X_anchor, X_candidates])``. Entries
+        ``< n_anchor`` came from the anchor.
 
-    Example
-    -------
-    See ``examples/run_minimal.py`` for a complete runnable script.
+    See ``examples/run_minimal.py`` for a runnable script.
     """
+    ensure_compiled()
     ext = get_ext()
-    # trace_path: if set, TSV-log every commit (phase, sel_pos, idx, val_hex,
-    # sep_hex) — used by test_determinism.py to localise single-vs-multi divergence.
-    _trace_f = open(trace_path, "w") if trace_path else None
 
-    def _trace(phase: str, sel_pos: int, idx: int, val: float, sep: float) -> None:
-        if _trace_f is not None:
-            _trace_f.write(f"{phase}\t{sel_pos}\t{idx}\t{float(val).hex()}\t{float(sep).hex()}\n")
-
-    N_A, N_C = X_anchor.shape[0], X_candidates.shape[0]
-    if N_A == 0:
+    n_anchor, n_cand = X_anchor.shape[0], X_candidates.shape[0]
+    if n_anchor == 0:
         raise ValueError("X_anchor is empty — need at least one anchor point.")
-    if X_anchor.shape[1] != X_candidates.shape[1] if N_C > 0 else False:
+    if n_cand > 0 and X_anchor.shape[1] != X_candidates.shape[1]:
         raise ValueError(
-            f"X_anchor and X_candidates feature dimension mismatch: {X_anchor.shape[1]} vs {X_candidates.shape[1]}"
+            f"feature-dim mismatch: X_anchor={X_anchor.shape[1]}, "
+            f"X_candidates={X_candidates.shape[1]}"
         )
 
-    ensure_compiled()
-
-    N = N_A + N_C
-    D = X_anchor.shape[1]
-    X = torch.cat([X_anchor, X_candidates], dim=0) if N_C > 0 else X_anchor
-    # C2: norms kept in float32 regardless of X's dtype.
+    n_total = n_anchor + n_cand
+    dim = X_anchor.shape[1]
+    X = torch.cat([X_anchor, X_candidates], dim=0) if n_cand > 0 else X_anchor
+    # C2: norms always float32 even if X is half — accumulator headroom.
     norms = (X * X).sum(dim=1).to(torch.float32)
 
-    # ---- Determine safe max_k based on available GPU memory ----
-    # Total scratch: 2 × X_sel copies (X_sel + sim_X_sel)  +  5 scalar arrays
-    # plus the working tensors X, norms, hausdorff, voronoi already allocated.
-    # We budget up to 30% of free GPU memory for the X_sel family.
-    _elem = X.element_size()
-    free_bytes, _total_bytes = torch.cuda.mem_get_info(X.device)
-    bytes_per_sel_row = 2 * D * _elem + 5 * 4
-    budget = int(free_bytes * 0.30)
-    if max_k is None:
-        max_k_mem = max(1, int(math.log2(max(1, budget // bytes_per_sel_row))))
-        max_k = min(int(math.log2(N)), max_k_mem)
+    max_k, max_sel = _resolve_max_k(max_k, n_total, dim, X.element_size(), X.device)
 
-    max_sel = 2**max_k
-    sel_bytes_total = 2 * max_sel * D * _elem + 5 * max_sel * 4
-    if sel_bytes_total > budget:
-        safe_k = max(1, int(math.log2(max(1, budget // bytes_per_sel_row))))
-        raise ValueError(
-            f"Coreset buffers would require {sel_bytes_total / 1e9:.1f} GB "
-            f"(2^max_k={max_sel}, D={D}, 2 X_sel copies + 5 scalar arrays) "
-            f"but budget is {budget / 1e9:.1f} GB (30% of {free_bytes / 1e9:.1f} GB free). "
-            f"Safe max_k for this GPU: {safe_k}"
-        )
+    anchor_indices = anchor_order.tolist()
+    nested_blocks: List[Set[int]] = [
+        set(anchor_indices[: min(2**i, n_anchor)]) for i in range(1, max_k + 1)
+    ]
 
-    target = anchor_order.tolist()
-    nested_blocks: List[Set[int]] = [set(target[: min(2**i, N_A)]) for i in range(1, max_k + 1)]
-
-    hausdorff = torch.full((N,), float("inf"), dtype=torch.float32, device=X.device)
-    voronoi = torch.zeros(N, dtype=torch.long, device=X.device)
-    X_sel = torch.empty((max_sel, D), dtype=X.dtype, device=X.device)
+    hausdorff = torch.full((n_total,), float("inf"), dtype=torch.float32, device=X.device)
+    voronoi = torch.zeros(n_total, dtype=torch.long, device=X.device)
+    X_sel = torch.empty((max_sel, dim), dtype=X.dtype, device=X.device)
     norms_sel = torch.empty(max_sel, dtype=torch.float32, device=X.device)
+    scratch = _alloc_scratch(max_sel, dim, X.dtype, X.device, ext.MAX_ARGMAX_BLOCKS)
 
-    # Pre-allocate scratch tensors (allocated once, reused across all steps)
-    _n_argmax_blocks = ext.MAX_ARGMAX_BLOCKS  # keep in sync with C++ constant
-    scratch: Dict = {
-        "block_vals": torch.empty(_n_argmax_blocks, dtype=torch.float32, device=X.device),
-        "block_idxs": torch.empty(_n_argmax_blocks, dtype=torch.int32, device=X.device),
-        "d_out_val": torch.empty(1, dtype=torch.float32, device=X.device),
-        "d_out_idx": torch.empty(1, dtype=torch.int32, device=X.device),
-        # dSL_quarter: used by _voronoi_step (replaces per-step GEMV + 3 allocs)
-        "dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=X.device),
-        # sim_* buffers: passed into simulate_fps_voronoi to avoid ~512 MB/call allocation
-        "sim_X_sel": torch.empty((max_sel, D), dtype=X.dtype, device=X.device),
-        "sim_norms_sel": torch.empty(max_sel, dtype=torch.float32, device=X.device),
-        "sim_dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=X.device),
-        # on-device sep/viable: eliminate per-step D2H in simulate_fps_voronoi
-        "d_local_sep": torch.zeros(1, dtype=torch.float32, device=X.device),
-        "d_viable": torch.zeros(1, dtype=torch.int32, device=X.device),
-        # active-center mask: skips exhausted Voronoi cells in compute_dSL_quarter
-        "sim_active_mask": torch.zeros(max_sel, dtype=torch.int32, device=X.device),
-        # Voronoi acceleration crossover threshold. Internal tuning knob;
-        # 0.5 has been the production default since the algorithm was tuned.
-        "full_fraction": 0.5,
-    }
+    trace = Tracer(trace_path)
+    profiler = PhaseTimer(enabled=profile, on_cuda=X.is_cuda)
 
-    first = target[0]
-    current_sel: List[int] = [first]
+    # Seed with the first anchor.
+    first = anchor_indices[0]
+    selected: List[int] = [first]
     selected_set: Set[int] = {first}
-    current_sep = float("inf")
-
+    sep = float("inf")
     voronoi_step(
         X,
         norms,
@@ -158,276 +105,322 @@ def accrete(
         0,
     )
 
-    prof = {
-        "snapshot_s": 0.0,
-        "select_block_s": 0.0,
-        "bisect_s": 0.0,
-        "replay_s": 0.0,
-        "fill_s": 0.0,
-        "voronoi_step_s": 0.0,
-    }
-
-    def _sync_cuda() -> None:
-        if X.is_cuda:
-            torch.cuda.synchronize()
-
     if verbose:
-        print(
-            f"{'k':<4} | {'size':<10} | {'in_Bk':>10} | {'from_A':>10} | {'from_C':>10} | {'time_s':>9} | {'sep':>9} | {'cov':>9} | {'rel_gap':>11}"
-        )
-        print("-" * 104)
+        _print_header()
 
     for k in range(1, max_k + 1):
         target_size = 2**k
-        points_needed = target_size - len(current_sel)
-        if points_needed <= 0:
+        budget = target_size - len(selected)
+        if budget <= 0:
             continue
-        target_blocks = nested_blocks[k - 1 :]
+
         if X.is_cuda:
             torch.cuda.synchronize()
-        _t_level = time.perf_counter()
+        t_level = time.perf_counter()
 
-        for block_pool in target_blocks:
-            if points_needed <= 0:
+        # Try to satisfy budget from each nested block in turn (level k, k+1, ...).
+        for block in nested_blocks[k - 1 :]:
+            if budget <= 0:
                 break
-            desired = sorted(block_pool - selected_set)
+            desired = sorted(block - selected_set)
             if not desired:
                 continue
 
-            # ---- Snapshot ----
-            if profile:
-                _sync_cuda()
-                t_prof = time.perf_counter()
-            h_snap = hausdorff.clone()
-            v_snap = voronoi.clone()  # NEW: also snapshot the Voronoi partition
-            sep_snap = current_sep
-            n_snap = len(current_sel)
-            sel_snap = list(current_sel)
-            if profile:
-                _sync_cuda()
-                prof["snapshot_s"] += time.perf_counter() - t_prof
+            # 1. Snapshot pre-block state (rolled back after the bisect picks best_m).
+            with profiler("snapshot_s"):
+                h_snap = hausdorff.clone()
+                v_snap = voronoi.clone()
+                sep_snap = sep
+                n_snap = len(selected)
+                sel_snap = list(selected)
 
-            # ---- Select block (forward FPS greedy on desired pool) ----
-            added: List[int] = []
-            step_seps: List[float] = [sep_snap]
-            max_add = min(points_needed, len(desired))
-            pool_t = torch.tensor(desired, dtype=torch.long, device=X.device)
-
-            if profile:
-                _sync_cuda()
-                t_prof = time.perf_counter()
-
-            for _step in range(max_add):
-                h_pool = hausdorff[pool_t]
-                best_val_t = h_pool.max()
-                best_val = float(best_val_t.item())
-                if best_val <= 0:
-                    break
-                # Deterministic tie-break: smallest *global* index among entries
-                # achieving max. torch.max returns smallest *pool position*, but
-                # swap-with-last below unsorts the pool, so pool-position
-                # tie-break diverges from multi-GPU (which keeps pool sorted and
-                # thus gets smallest-global-index for free). Pick globally here.
-                tied_mask = h_pool == best_val_t
-                best_idx = int(pool_t[tied_mask].min().item())
-                best_local_idx = int((pool_t == best_idx).nonzero(as_tuple=True)[0][0].item())
-
-                current_sep = min(current_sep, best_val)
-                step_seps.append(current_sep)
-                added.append(best_idx)
-                sel_pos = len(current_sel)
-                current_sel.append(best_idx)
-                selected_set.add(best_idx)
-                _trace("forward", sel_pos, best_idx, best_val, current_sep)
-
-                if profile:
-                    _sync_cuda()
-                    t_step = time.perf_counter()
-                voronoi_step(
-                    X,
-                    norms,
-                    hausdorff,
-                    voronoi,
-                    X_sel,
-                    norms_sel,
-                    scratch["dSL_quarter"],
-                    scratch["d_out_idx"],
-                    best_idx,
-                    sel_pos,
-                )
-                if profile:
-                    _sync_cuda()
-                    prof["voronoi_step_s"] += time.perf_counter() - t_step
-
-                pool_t[best_local_idx] = pool_t[-1]
-                pool_t = pool_t[:-1]
-
-            if profile:
-                _sync_cuda()
-                prof["select_block_s"] += time.perf_counter() - t_prof
-
-            if not added:
-                continue
-
-            h_final = hausdorff.clone()
-            v_final = voronoi.clone()
-
-            # ---- Bisect ----
-            if profile:
-                _sync_cuda()
-                t_prof = time.perf_counter()
-            best_m = bisect_voronoi_fast(
-                X,
-                norms,
-                h_snap,
-                h_final,
-                v_final,
-                v_snap,
-                sel_snap,
-                added,
-                step_seps,
-                points_needed,
-                n_snap,
-                scratch,
-            )
-            if profile:
-                _sync_cuda()
-                prof["bisect_s"] += time.perf_counter() - t_prof
-
-            # ---- Roll back to snapshot ----
-            hausdorff.copy_(h_snap)
-            voronoi.copy_(v_snap)
-            current_sel = list(sel_snap)
-            selected_set = set(sel_snap)
-            current_sep = sep_snap
-
-            # ---- Replay best_m steps ----
-            if profile:
-                _sync_cuda()
-                t_prof = time.perf_counter()
-            for j in range(best_m):
-                idx = added[j]
-                sel_pos = len(current_sel)
-                current_sel.append(idx)
-                selected_set.add(idx)
-                current_sep = step_seps[j + 1]
-                _trace("replay", sel_pos, idx, current_sep, current_sep)
-                if profile:
-                    _sync_cuda()
-                    t_step = time.perf_counter()
-                voronoi_step(
-                    X,
-                    norms,
-                    hausdorff,
-                    voronoi,
-                    X_sel,
-                    norms_sel,
-                    scratch["dSL_quarter"],
-                    scratch["d_out_idx"],
-                    idx,
-                    sel_pos,
-                )
-                if profile:
-                    _sync_cuda()
-                    prof["voronoi_step_s"] += time.perf_counter() - t_step
-            if profile:
-                _sync_cuda()
-                prof["replay_s"] += time.perf_counter() - t_prof
-
-            points_needed -= best_m
-
-        # ---- Fill remaining points with unconstrained FPS ----
-        if profile:
-            _sync_cuda()
-            t_prof = time.perf_counter()
-        while points_needed > 0:
-            best_val_t, best_idx_t = torch.max(hausdorff, dim=0)
-            best_idx = int(best_idx_t.item())
-            best_val = float(best_val_t.item())
-            current_sep = min(current_sep, best_val)
-            sel_pos = len(current_sel)
-            current_sel.append(best_idx)
-            selected_set.add(best_idx)
-            _trace("fill", sel_pos, best_idx, best_val, current_sep)
-            if profile:
-                _sync_cuda()
-                t_step = time.perf_counter()
-            voronoi_step(
+            # 2. Greedy forward FPS over the desired pool, recording sep at each step.
+            added, step_seps = _select_block_forward(
                 X,
                 norms,
                 hausdorff,
                 voronoi,
                 X_sel,
                 norms_sel,
-                scratch["dSL_quarter"],
-                scratch["d_out_idx"],
-                best_idx,
-                sel_pos,
+                scratch,
+                desired,
+                budget,
+                selected,
+                selected_set,
+                sep,
+                sep_snap,
+                trace,
+                profiler,
             )
-            if profile:
-                _sync_cuda()
-                prof["voronoi_step_s"] += time.perf_counter() - t_step
-            points_needed -= 1
-        if profile:
-            _sync_cuda()
-            prof["fill_s"] += time.perf_counter() - t_prof
+            if not added:
+                continue
+            sep = step_seps[-1]
+
+            # 3. Bisect: largest m for which keeping ``added[:m]`` still admits
+            #    a viable FPS completion (sep > cov throughout).
+            h_final = hausdorff.clone()
+            v_final = voronoi.clone()
+            with profiler("bisect_s"):
+                best_m = bisect_voronoi_fast(
+                    X,
+                    norms,
+                    h_snap,
+                    h_final,
+                    v_final,
+                    v_snap,
+                    sel_snap,
+                    added,
+                    step_seps,
+                    budget,
+                    n_snap,
+                    scratch,
+                )
+
+            # 4. Roll back to snapshot, then replay best_m steps.
+            hausdorff.copy_(h_snap)
+            voronoi.copy_(v_snap)
+            selected = list(sel_snap)
+            selected_set = set(sel_snap)
+            sep = sep_snap
+
+            with profiler("replay_s"):
+                for j in range(best_m):
+                    new_idx = added[j]
+                    sel_pos = len(selected)
+                    selected.append(new_idx)
+                    selected_set.add(new_idx)
+                    sep = step_seps[j + 1]
+                    trace("replay", sel_pos, new_idx, sep, sep)
+                    with profiler("voronoi_step_s"):
+                        voronoi_step(
+                            X,
+                            norms,
+                            hausdorff,
+                            voronoi,
+                            X_sel,
+                            norms_sel,
+                            scratch["dSL_quarter"],
+                            scratch["d_out_idx"],
+                            new_idx,
+                            sel_pos,
+                        )
+
+            budget -= best_m
+
+        # Fill remainder with unconstrained FPS over all available rows.
+        with profiler("fill_s"):
+            while budget > 0:
+                best_val_t, best_idx_t = torch.max(hausdorff, dim=0)
+                new_idx = int(best_idx_t.item())
+                best_val = float(best_val_t.item())
+                sep = min(sep, best_val)
+                sel_pos = len(selected)
+                selected.append(new_idx)
+                selected_set.add(new_idx)
+                trace("fill", sel_pos, new_idx, best_val, sep)
+                with profiler("voronoi_step_s"):
+                    voronoi_step(
+                        X,
+                        norms,
+                        hausdorff,
+                        voronoi,
+                        X_sel,
+                        norms_sel,
+                        scratch["dSL_quarter"],
+                        scratch["d_out_idx"],
+                        new_idx,
+                        sel_pos,
+                    )
+                budget -= 1
 
         if X.is_cuda:
             torch.cuda.synchronize()
-        _level_s = time.perf_counter() - _t_level
+        level_secs = time.perf_counter() - t_level
 
-        # End-of-level invariant check + numeric rel_gap diagnostic.
-        # Mirrors src/python/coreset.py.  Hard abort on gross violation
-        # (rel_gap < -1e-3, well below float32 noise floor); print rel_gap
-        # numerically.  Authoritative check is the float64 post-hoc verifier.
-        GROSS_VIOLATION_REL = 1e-3
-
-        cov_sq = float(hausdorff.max().item())
-        if cov_sq < 0.0:
-            cov_sq = 0.0
-        sep_sq = current_sep
-        sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
-        cov_val = math.sqrt(cov_sq)
-        rel_gap = (
-            (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
-        )
-
-        if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_VIOLATION_REL):
-            raise RuntimeError(
-                f"accrete (CUDA): sep > cov violated at level k={k} "
-                f"(size={target_size}): sep={sep_val:.8e}, cov={cov_val:.8e}, "
-                f"sep^2={sep_sq:.8e}, cov^2={cov_sq:.8e}, rel_gap={rel_gap:.3e}. "
-                f"Gross violation, not float noise.  Likely cause: cascade "
-                f"over-optimism or bug.  Consider float64 in the bisect's "
-                f"distance computation, or smaller max_k."
-            )
-
+        cov_sq, sep_val, cov_val, rel_gap = _check_invariant(hausdorff, sep, k, target_size)
         if verbose:
-            sel_set = set(current_sel[:target_size])
-            in_bk = len(sel_set & nested_blocks[k - 1])
-            from_a = sum(1 for s in sel_set if s < N_A)
-            rel_gap_str = f"{rel_gap:>11.3e}" if math.isfinite(rel_gap) else f"{'inf':>11}"
-            print(
-                f"{k:<4} | {target_size:<10} | {in_bk:>10} | {from_a:>10} | {target_size - from_a:>10} | {_level_s:>9.2f} | {sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str}",
-                flush=True,
+            _print_level_row(
+                k,
+                target_size,
+                selected,
+                nested_blocks[k - 1],
+                n_anchor,
+                level_secs,
+                sep_val,
+                cov_val,
+                rel_gap,
             )
 
     if profile:
-        total = sum(prof.values())
-        print("\n[Profile: accrete phases]")
-        for key in (
-            "snapshot_s",
-            "select_block_s",
-            "bisect_s",
-            "replay_s",
-            "fill_s",
-            "voronoi_step_s",
-        ):
-            val = prof[key]
-            pct = (100.0 * val / total) if total > 0 else 0.0
-            print(f"  {key:<14} {val:8.3f}s  ({pct:5.1f}%)")
+        profiler.report("accrete phases")
+    trace.close()
+    return torch.tensor(selected, dtype=torch.long, device=X.device)
 
-    if _trace_f is not None:
-        _trace_f.close()
 
-    return torch.tensor(current_sel, dtype=torch.long, device=X.device)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_max_k(max_k, n_total, dim, elem_bytes, device):
+    """Pick ``max_k`` against a 30%-of-free-mem budget for the X_sel buffers.
+
+    Per selected row we hold 2 × D copies (X_sel + sim_X_sel) plus 5 scalar
+    arrays. Caller can override; if ``max_k`` is given but exceeds budget we
+    raise so the user is forced to pin a safe value rather than OOM mid-run.
+    """
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    bytes_per_sel_row = 2 * dim * elem_bytes + 5 * 4
+    budget = int(free_bytes * 0.30)
+
+    if max_k is None:
+        max_k_mem = max(1, int(math.log2(max(1, budget // bytes_per_sel_row))))
+        max_k = min(int(math.log2(n_total)), max_k_mem)
+
+    max_sel = 2**max_k
+    needed_bytes = 2 * max_sel * dim * elem_bytes + 5 * max_sel * 4
+    if needed_bytes > budget:
+        safe_k = max(1, int(math.log2(max(1, budget // bytes_per_sel_row))))
+        raise ValueError(
+            f"Coreset buffers need {needed_bytes / 1e9:.1f} GB "
+            f"(2^max_k={max_sel}, D={dim}) but budget is {budget / 1e9:.1f} GB "
+            f"(30% of {free_bytes / 1e9:.1f} GB free). Safe max_k for this GPU: {safe_k}"
+        )
+    return max_k, max_sel
+
+
+def _alloc_scratch(max_sel, dim, x_dtype, device, n_argmax_blocks):
+    """Persistent scratch buffers reused every step (avoid per-step alloc)."""
+    return {
+        "block_vals": torch.empty(n_argmax_blocks, dtype=torch.float32, device=device),
+        "block_idxs": torch.empty(n_argmax_blocks, dtype=torch.int32, device=device),
+        "d_out_val": torch.empty(1, dtype=torch.float32, device=device),
+        "d_out_idx": torch.empty(1, dtype=torch.int32, device=device),
+        "dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=device),
+        # Sim buffers — passed into simulate_fps_voronoi to skip ~512 MB/call alloc.
+        "sim_X_sel": torch.empty((max_sel, dim), dtype=x_dtype, device=device),
+        "sim_norms_sel": torch.empty(max_sel, dtype=torch.float32, device=device),
+        "sim_dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=device),
+        # On-device sep + viability flag — kill per-step D2H sync inside simulate.
+        "d_local_sep": torch.zeros(1, dtype=torch.float32, device=device),
+        "d_viable": torch.zeros(1, dtype=torch.int32, device=device),
+        "sim_active_mask": torch.zeros(max_sel, dtype=torch.int32, device=device),
+        # Voronoi/full crossover; 0.5 is the production-tuned default.
+        "full_fraction": 0.5,
+    }
+
+
+def _select_block_forward(
+    X,
+    norms,
+    hausdorff,
+    voronoi,
+    X_sel,
+    norms_sel,
+    scratch,
+    desired,
+    budget,
+    selected,
+    selected_set,
+    sep,
+    sep_snap,
+    trace,
+    profiler,
+):
+    """Greedy forward FPS over ``desired``. Returns (added, step_seps).
+
+    Tie-break: smallest *global* index. ``torch.max`` returns the smallest
+    pool position, but the swap-with-last trick below unsorts the pool, so
+    we must explicitly resolve ties on the global index — otherwise we
+    diverge from the multi-GPU path (which keeps its pool sorted and gets
+    smallest-global-index for free).
+    """
+    added: List[int] = []
+    step_seps: List[float] = [sep_snap]
+    max_add = min(budget, len(desired))
+    pool = torch.tensor(desired, dtype=torch.long, device=X.device)
+
+    with profiler("select_block_s"):
+        for _ in range(max_add):
+            h_pool = hausdorff[pool]
+            best_val_t = h_pool.max()
+            best_val = float(best_val_t.item())
+            if best_val <= 0:
+                break
+
+            tied = h_pool == best_val_t
+            new_idx = int(pool[tied].min().item())
+            pool_pos = int((pool == new_idx).nonzero(as_tuple=True)[0][0].item())
+
+            sep = min(sep, best_val)
+            step_seps.append(sep)
+            added.append(new_idx)
+            sel_pos = len(selected)
+            selected.append(new_idx)
+            selected_set.add(new_idx)
+            trace("forward", sel_pos, new_idx, best_val, sep)
+
+            with profiler("voronoi_step_s"):
+                voronoi_step(
+                    X,
+                    norms,
+                    hausdorff,
+                    voronoi,
+                    X_sel,
+                    norms_sel,
+                    scratch["dSL_quarter"],
+                    scratch["d_out_idx"],
+                    new_idx,
+                    sel_pos,
+                )
+
+            # Swap winner with last; trim. Keeps pool a tensor without realloc.
+            pool[pool_pos] = pool[-1]
+            pool = pool[:-1]
+
+    return added, step_seps
+
+
+def _check_invariant(hausdorff, sep_sq, k, target_size):
+    """Verify Gonzalez ``sep > cov``; abort hard on gross float-noise breach."""
+    GROSS_REL = 1e-3  # well below float32 noise; authoritative check is f64 verifier
+    cov_sq = max(0.0, float(hausdorff.max().item()))
+    sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
+    cov_val = math.sqrt(cov_sq)
+    rel_gap = (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
+
+    if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_REL):
+        raise RuntimeError(
+            f"accrete: sep > cov violated at level k={k} (size={target_size}): "
+            f"sep={sep_val:.8e}, cov={cov_val:.8e}, rel_gap={rel_gap:.3e}. "
+            "Gross violation, not float noise."
+        )
+    return cov_sq, sep_val, cov_val, rel_gap
+
+
+# ---------------------------------------------------------------------------
+# Pretty-print + tracing + profiling (factored out to keep the main loop clean)
+# ---------------------------------------------------------------------------
+
+
+def _print_header() -> None:
+    print(
+        f"{'k':<4} | {'size':<10} | {'in_Bk':>10} | {'from_A':>10} | {'from_C':>10} "
+        f"| {'time_s':>9} | {'sep':>9} | {'cov':>9} | {'rel_gap':>11}"
+    )
+    print("-" * 104)
+
+
+def _print_level_row(
+    k, target_size, selected, block_k, n_anchor, level_secs, sep_val, cov_val, rel_gap
+):
+    sel_set = set(selected[:target_size])
+    in_bk = len(sel_set & block_k)
+    from_a = sum(1 for s in sel_set if s < n_anchor)
+    rel_gap_str = f"{rel_gap:>11.3e}" if math.isfinite(rel_gap) else f"{'inf':>11}"
+    print(
+        f"{k:<4} | {target_size:<10} | {in_bk:>10} | {from_a:>10} | "
+        f"{target_size - from_a:>10} | {level_secs:>9.2f} | "
+        f"{sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str}",
+        flush=True,
+    )

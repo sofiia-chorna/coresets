@@ -1,46 +1,21 @@
-// kernels/multi.cu — split out from the original kernels.cu.
+// kernels/multi.cu — multi-GPU helpers (packed argmax + reduce-and-commit).
 #include "_shared.cuh"
 
-// 8b. Multi-GPU helpers (packed argmax + reduce-and-commit)
+// Sharding (replicated-X path):
+//   X / norms / X_sel / norms_sel : replicated per rank
+//   h_shard / v_shard             : sharded, each rank owns a contiguous slice
 //
-// Sharding strategy
-//   X         : replicated per rank (1.3 GB at N=651K,D=512 — fits easily)
-//   norms     : replicated per rank
-//   X_sel     : replicated per rank
-//   norms_sel : replicated per rank
-//   h_shard   : SHARDED, each rank owns a contiguous row range
-//   v_shard   : SHARDED alongside h_shard
+// Per-step pipeline:
+//   argmax_cuda → pack_argmax_pair → AllGather[2G] → reduce_and_commit_multi
+//   → compute_dSL_quarter → voronoi_update_cuda
 //
-// Consequence: any rank can evaluate fps_update / voronoi_update on its
-// own shard without talking to anyone else (X is local). The only thing
-// that needs cross-rank communication is the global argmax.
-//
-// Per-step pipeline
-//   1. argmax_cuda on h_shard                          → local (val, idx)
-//   2. pack_argmax_pair: (val, global_idx) into 8 B    → argmax_local_pack
-//        — NB: global_idx is stored via __int_as_float (bitcast), NOT
-//          `(float)idx`, which would snap indices ≥ 2^24 to the nearest
-//          representable float. See "C3" comment on pack_argmax_pair_kernel.
-//   3. AllGather across G ranks                        → argmax_gather_buf[2G]
-//   4. reduce_and_commit_multi:
-//        — find winner with deterministic tie-break (§3 comment block)
-//        — mirror commit_center_with_sep's bookkeeping
-//        — only the owning rank writes h_shard[local]=-1, v_shard[local]=n_sel
-//        — every rank copies X_full[best_idx] → X_sel[n_sel] (X is replicated)
-//   5. compute_dSL_quarter (replicated; every rank does the same work)
-//   6. voronoi_update_cuda on local h_shard / v_shard
-//
-// Total communication per step: one NCCL AllGather of 2G floats = 8G bytes.
-// At G=4 that's 32 B over NVLink — essentially free.
-// D2H traffic: 4 B every 16 steps for d_viable, identical to single-GPU.
-// ===========================================================================
+// Per step: one NCCL AllGather of 2G floats (~8G bytes — essentially free
+// over NVLink). D2H is 4 B every 16 steps for d_viable.
 
-// C3: Pack the global index by bitcasting its int32 representation into the
-// float slot (via __int_as_float).  A plain `(float)idx` cast is *lossy* for
-// indices > 2^24 (= 16,777,216) — float32 only represents integers exactly
-// below that threshold.  At 100M structures, silently-snapped indices would
-// pick the wrong winner across ranks.  The bitcast is lossless for all
-// indices that fit in int32 (i.e. < 2^31), which easily covers 100M.
+// C3: Pack the global idx by int32→float bitcast (__int_as_float). A plain
+// `(float)idx` snaps indices ≥ 2^24 to the nearest representable float —
+// would pick the wrong winner at 100 M scale. The bitcast is lossless for
+// all int32 indices (covers ≤ 2^31, far above any production N).
 __global__ void pack_argmax_pair_kernel(const float* __restrict__ d_out_val,  // [1]
                                         const int* __restrict__ d_out_idx,    // [1]
                                         const int64_t shard_offset,
@@ -156,7 +131,7 @@ void reduce_and_commit_multi_cuda(torch::Tensor gather_buf, int64_t world_size,
         }));
 }
 
-// 8c. simulate_fps_voronoi_multi — C++/NCCL multi-GPU sim loop
+// simulate_fps_voronoi_multi — replicated-X multi-GPU sim loop (C++/NCCL).
 
 std::tuple<bool, int64_t> simulate_fps_voronoi_multi(
     torch::Tensor X_shard,         // [N_shard, D]
@@ -268,41 +243,24 @@ std::tuple<bool, int64_t> simulate_fps_voronoi_multi(
     return std::make_tuple(h_viable != 0, points_left);
 }
 
-// 8d. Sharded-X multi-GPU helpers (AllGather-with-row)
+// Sharded-X multi-GPU helpers (AllGather-with-row).
 //
-// The replicated-X path in 8a–8c assumes every rank holds X_full.  That caps
-// memory at ≈ 27 M × 512 × 4 B ≈ 54 GB per rank regardless of GPU count.
-// OMat24-full (110 M × 512 × 4 B ≈ 225 GB replicated) does not fit on any
-// single H100 SKU.  The sharded path below splits X across ranks so each
-// rank only holds N / G rows.
+// The replicated-X path needs X_full on every rank — caps memory at ~27 M
+// rows per H100. OMat24 (110 M × 512 × 4 B ≈ 225 GB) doesn't fit. The
+// sharded path splits X across ranks so each holds N/G rows.
 //
-// The per-step collective count is unchanged — still one AllGather — but
-// the payload grows to include the winning candidate row and its norm:
+// Same per-step collective count, fatter payload: each rank packs
+// [val, global_idx_bitcast, norm, row_0..row_{D-1}] = 3+D floats; the
+// reduce kernel picks the winner rank r* and reads its row from
+// gather_buf[r*·(3+D)+3 ..]. Bandwidth at G=8/D=512 is ~16 KB per step;
+// over ~1 M FPS steps that's ~16 GB on NVLink — seconds vs hours of compute.
 //
-//   argmax_local_pack:  [val, global_idx_bitcast, norm, row_0..row_{D-1}]
-//                       (3 + D) float32 slots per rank
-//   argmax_gather_buf:  [G * (3 + D)] float32
+// Determinism: byte-identical to the replicated and single-GPU paths.
+// Tie-break (smallest global idx on equal values) is unchanged.
 //
-// After the AllGather every rank has all G candidate rows.  The reduce
-// kernel picks the winner rank r*, reads its row from
-//   gather_buf[r* * (3 + D) + 3 .. r* * (3 + D) + 3 + D]
-// and commits it to X_sel[n_sel].  Same for norm.  Zero extra comms beyond
-// the existing AllGather.
-//
-// Bandwidth cost at G=8, D=512: 8 × 515 × 4 B = 16480 B per step vs 64 B
-// in the pair-only path.  At ~1 M FPS steps that is ~16 GB total over
-// NVLink — seconds of cost against hours of compute.
-//
-// Determinism: the sharded path is byte-identical to the single-GPU and
-// replicated-multi-GPU paths on the same input.  The tie-break logic
-// (smallest global index wins on equal values) is unchanged — the only
-// change is *where* the winning row comes from, not *which* row.
-//
-// scalar_t: the pack buffer is always float32.  For scalar_t != float the
-// row is upcast on write and downcast on read; this roundtrip is bit-exact
-// because the original row values are already representable in the source
-// dtype, so float→scalar_t is lossless.
-// ===========================================================================
+// scalar_t: pack buffer is always float32; non-float scalar_t roundtrips
+// upcast→downcast losslessly because the row values are already
+// representable in the source dtype.
 
 template <typename scalar_t>
 __global__ void pack_argmax_with_row_kernel(const scalar_t* __restrict__ X_local,   // [N_local, D]
@@ -470,16 +428,10 @@ void reduce_and_commit_multi_sharded_cuda(torch::Tensor gather_buf, int64_t worl
         }));
 }
 
-// 8e. simulate_fps_voronoi_multi_sharded — C++/NCCL sharded sim loop
-//
-// Mirrors simulate_fps_voronoi_multi exactly, except:
-//   - no X_full / norms_full arguments (there is no replicated X)
-//   - pack_argmax_pair_cuda           → pack_argmax_with_row_cuda
-//   - fill_pack_neg_inf_cuda          → fill_pack_with_row_neg_inf_cuda
-//   - reduce_and_commit_multi_cuda    → reduce_and_commit_multi_sharded_cuda
-//   - final_viable_check_multi_kernel → final_viable_check_multi_sharded_kernel
-//   - gather_buf is [world_size * (3 + D)] float32, not [world_size * 2]
-// ===========================================================================
+// simulate_fps_voronoi_multi_sharded — sharded-X variant of the multi sim.
+// Same pipeline, but pack_argmax_pair → pack_argmax_with_row,
+// reduce_and_commit_multi → reduce_and_commit_multi_sharded, and
+// gather_buf is [world_size·(3+D)] float32 instead of [world_size·2].
 
 std::tuple<bool, int64_t> simulate_fps_voronoi_multi_sharded(
     torch::Tensor X_local,         // [N_local, D] — shard-owned, no replication

@@ -1,9 +1,6 @@
-"""Pure-Python reference implementation of the FPS-accretion coreset.
+"""Pure-Python reference implementation of FPS-accretion.
 
-- ``accrete``: Voronoi-accelerated accretion. Same guarantees as the CUDA
-  path in ``coreset_cuda``, ~4× slower; kept for tests and validation.
-
-Uses ``fps_update`` from ``fps_torch`` as the core FPS primitive.
+Same guarantees as the CUDA path, ~4× slower. Kept for tests and validation.
 """
 
 import math
@@ -13,10 +10,6 @@ import torch
 from torch import Tensor
 
 from .fps import fps_update
-
-# ---------------------------------------------------------------------------
-# Merge two coreset hierarchies
-# ---------------------------------------------------------------------------
 
 
 def _voronoi_step(
@@ -31,10 +24,10 @@ def _voronoi_step(
     sel_pos: int,
     full_threshold: int,
 ) -> None:
-    """One voronoi-accelerated FPS step: update hausdorff/voronoi in-place.
+    """One Voronoi-accelerated FPS step (in-place).
 
-    Like ``fps_update`` but uses the triangle inequality to skip distance
-    computation for points that cannot change their Voronoi assignment.
+    Triangle inequality skips the distance compute for points that can't
+    change Voronoi cell.
     """
     X_sel[sel_pos] = X[new_idx]
     norms_sel[sel_pos] = norms[new_idx]
@@ -85,12 +78,10 @@ def _reconstruct_hausdorff(
     n_snap: int,
     sel_start: List[int],
 ) -> Tuple[Tensor, float]:
-    """Reconstruct hausdorff at prefix ``m`` of a restricted FPS run.
+    """Reconstruct hausdorff at prefix ``m``. Returns (h_m, cov_m).
 
-    Uses the voronoi assignment from the full run to identify which points
-    are affected (nearest selection removed) and recomputes only those.
-
-    Returns (h_m, cov_m) where cov_m = max(h_m) over unselected points.
+    Voronoi-aware: only recomputes distances for points whose nearest
+    selection was removed.
     """
     device = X.device
     affected = v_final >= (n_snap + m)
@@ -107,7 +98,6 @@ def _reconstruct_hausdorff(
             added_t = torch.tensor(added[:m], dtype=torch.long, device=device)
             X_add = X[added_t]
             norms_add = norms[added_t]
-            # Chunked distance to avoid OOM on large m
             n_aff = len(affected_idx)
             norms_aff = norms[affected_idx]
             X_aff = X[affected_idx]
@@ -144,11 +134,10 @@ def _bisect_voronoi(
     total_budget: int,
     n_snap: int,
 ) -> int:
-    """Binary search for max viable prefix using voronoi-based reconstruction.
+    """Binary-search the max viable prefix via Voronoi reconstruction.
 
-    Instead of storing O(pool × N) hausdorff history, reconstructs any
-    prefix's hausdorff from the final voronoi assignment in O(|affected| × m).
-    Uses a kth-value bound as fast path for coverage checks.
+    Reconstructs any prefix's hausdorff in O(|affected| × m) instead of
+    storing the full O(pool × N) history. Uses kth-value as a fast path.
     """
     N = X.shape[0]
     low, high, best = 0, len(added), 0
@@ -231,39 +220,15 @@ def accrete(
     max_k: Optional[int] = None,
     verbose: bool = True,
 ) -> Tensor:
-    """Voronoi-accelerated accretion with coverage guarantees.
+    """Voronoi-accelerated accretion. Coverage guarantee: sep > cov at every 2^k.
 
-    Three optimisations over a naive level-by-level FPS:
+    Three wins over level-by-level FPS:
+      1. Hausdorff/voronoi state carried forward across levels (no replay).
+      2. Triangle-inequality skip in the per-step Hausdorff update.
+      3. Voronoi-based bisection — O(|affected| × m × D) per probe instead
+         of storing the full O(pool × N) history.
 
-    1. **Carried state**: hausdorff and voronoi are carried forward across
-       levels (no full-state replay at each level boundary).
-    2. **Voronoi-accelerated updates**: triangle inequality skips distance
-       computations for points that can't change Voronoi cell.
-    3. **Voronoi-based bisection**: instead of storing O(pool × N) hausdorff
-       history, reconstructs any prefix's hausdorff from the final voronoi
-       assignment in O(|affected| × m × D).
-
-    Coverage is guaranteed: at each 2^k boundary, sep > cov.
-
-    Parameters
-    ----------
-    X_anchor : Tensor (N_A, D)
-        Descriptors for the existing set.
-    X_candidates : Tensor (N_C, D)
-        Descriptors for the new points.
-    anchor_order : Tensor (N_A,) int64
-        FPS ordering for A (the hierarchy to preserve).
-    candidate_order : Tensor (N_C,) int64
-        FPS ordering for C.
-    max_k : int, optional
-        Maximum level (default: floor(log2(N_A + N_C))).
-    verbose : bool
-        Print per-level progress.
-
-    Returns
-    -------
-    Tensor (2^max_k,) int64
-        Coreset sequence over A ∪ C.
+    Returns ``(2^max_k,) int64`` indices over ``cat([X_anchor, X_candidates])``.
     """
     N_A, N_C = X_anchor.shape[0], X_candidates.shape[0]
     N = N_A + N_C
@@ -275,28 +240,19 @@ def accrete(
         max_k = int(math.log2(N))
     max_k_A = int(math.log2(N_A)) if N_A > 1 else 0
 
-    # Remap C indices to union space
-    idx_C_u = candidate_order + N_A
     target = anchor_order.tolist()
+    nested_blocks: List[Set[int]] = [set(target[: min(2**i, N_A)]) for i in range(1, max_k + 1)]
 
-    # Nested target sets from A
-    nested_blocks: List[Set[int]] = []
-    for i in range(1, max_k + 1):
-        nested_blocks.append(set(target[: min(2**i, N_A)]))
-
-    # FPS state over full union — carried forward across levels
     hausdorff = torch.full((N,), float("inf"), dtype=X.dtype, device=X.device)
     voronoi = torch.zeros(N, dtype=torch.long, device=X.device)
     d = torch.empty(N, dtype=X.dtype, device=X.device)
 
-    # Selected descriptors buffer for voronoi acceleration
     max_sel = 2**max_k
     X_sel = torch.empty((max_sel, D), dtype=X.dtype, device=X.device)
     norms_sel = torch.empty(max_sel, dtype=X.dtype, device=X.device)
 
-    full_threshold = int(0.5 * N)  # voronoi acceleration crossover; internal default
+    full_threshold = int(0.5 * N)  # Voronoi/full-pass crossover; production default
 
-    # Initialize with first A point
     first = target[0]
     current_sel: List[int] = [first]
     selected_set: Set[int] = {first}
@@ -458,24 +414,12 @@ def accrete(
             )
             points_needed -= 1
 
-        # End-of-level invariant check + numeric rel_gap diagnostic.
-        #
-        # Uses the running sep (current_sep, the true min FPS step distance to
-        # date by the Gonzalez identity) and the post-level hausdorff.max
-        # (= cov^2 over unselected, since selected entries are masked to -1).
-        # No replay; cost is one .max() call per level.
-        #
-        # rel_gap = sep^2 / cov^2 - 1.  Mathematically >= 0 by Gonzalez; in
-        # float32 can appear slightly negative at the precision floor (~3e-6
-        # for D=512 dot products).  We hard-abort only on a *gross* violation
-        # (rel_gap < -1e-3, way below float32 noise) -- that's a real cascade
-        # failure or implementation bug.  The authoritative check is the
-        # float64 post-hoc verifier (tests/verify_parity.py).
-        GROSS_VIOLATION_REL = 1e-3  # abort if rel_gap < -GROSS_VIOLATION_REL
+        # End-of-level Gonzalez invariant: sep > cov. Hard-abort only on a
+        # gross violation (well below float32 noise); the authoritative check
+        # is the float64 post-hoc verifier.
+        GROSS_VIOLATION_REL = 1e-3
 
-        cov_sq = float(hausdorff.max().item())
-        if cov_sq < 0.0:
-            cov_sq = 0.0  # all points selected -> cov = 0
+        cov_sq = max(0.0, float(hausdorff.max().item()))
         sep_sq = current_sep
         sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
         cov_val = math.sqrt(cov_sq)
@@ -485,12 +429,9 @@ def accrete(
 
         if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_VIOLATION_REL):
             raise RuntimeError(
-                f"accrete: sep > cov violated at level k={k} "
-                f"(size={target_size}): sep={sep_val:.8e}, cov={cov_val:.8e}, "
-                f"sep^2={sep_sq:.8e}, cov^2={cov_sq:.8e}, rel_gap={rel_gap:.3e}. "
-                f"Gross violation, not float noise.  Likely cause: cascade "
-                f"over-optimism or implementation bug.  Consider float64 in "
-                f"the bisect's distance computation, or smaller max_k."
+                f"accrete: sep > cov violated at k={k} (size={target_size}): "
+                f"sep={sep_val:.8e}, cov={cov_val:.8e}, rel_gap={rel_gap:.3e}. "
+                "Gross violation, not float noise."
             )
 
         if verbose:

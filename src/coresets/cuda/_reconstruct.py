@@ -1,11 +1,13 @@
-"""Hausdorff-state reconstruction for bisect-mid prefixes.
+"""Hausdorff-state reconstruction at bisect-mid prefixes.
 
-Two helpers:
-  - ``reconstruct_hausdorff``: original (non-Voronoi) chunked recompute, kept
-    as a fallback when no voronoi state is available.
-  - ``reconstruct_hausdorff_with_voronoi``: Voronoi-aware path used by
-    ``bisect_voronoi_fast`` — only touches points whose nearest center could
-    have changed, O(|affected| × m) rather than O(N × m).
+Two helpers, both used to rebuild ``(h, voronoi)`` for an arbitrary prefix
+length without re-running FPS from scratch:
+
+* :func:`reconstruct_hausdorff` — original chunked recompute, no Voronoi
+  (kept as a fallback when Voronoi state isn't available).
+* :func:`reconstruct_hausdorff_with_voronoi` — only touches points whose
+  nearest center could have changed. ``O(|affected| × m)`` rather than
+  ``O(N × m)``. This is the path the bisect actually uses.
 """
 
 from __future__ import annotations
@@ -27,25 +29,24 @@ def reconstruct_hausdorff(
     n_snap: int,
     sel_start: List[int],
 ) -> Tuple[Tensor, float]:
-    """Original (non-Voronoi) reconstruction.  Kept as a fallback."""
+    """Original (non-Voronoi) reconstruction. Fallback path."""
     device = X.device
     affected = v_final >= (n_snap + m)
 
     if m == len(added) or not affected.any():
-        h_m = h_final.clone()
+        h_mid = h_final.clone()
     else:
-        h_m = h_final.clone()
+        h_mid = h_final.clone()
         affected_idx = torch.where(affected)[0]
 
         if m == 0:
-            h_m[affected_idx] = h_snap[affected_idx]
+            h_mid[affected_idx] = h_snap[affected_idx]
         else:
             added_t = torch.tensor(added[:m], dtype=torch.long, device=device)
-            X_add = X[added_t]
-            norms_add = norms[added_t]
-            n_aff = len(affected_idx)
-            norms_aff = norms[affected_idx]
-            X_aff = X[affected_idx]
+            X_add, norms_add = X[added_t], norms[added_t]
+            X_aff, norms_aff = X[affected_idx], norms[affected_idx]
+            n_aff = affected_idx.numel()
+
             min_to_added = torch.full((n_aff,), float("inf"), dtype=torch.float32, device=device)
             chunk = max(1, 10_000_000 // max(n_aff, 1))
             for start in range(0, m, chunk):
@@ -56,15 +57,14 @@ def reconstruct_hausdorff(
                     - 2.0 * (X_aff @ X_add[start:end].T)
                 )
                 torch.minimum(min_to_added, d_chunk.min(dim=1).values, out=min_to_added)
-            h_m[affected_idx] = torch.minimum(h_snap[affected_idx], min_to_added)
+            h_mid[affected_idx] = torch.minimum(h_snap[affected_idx], min_to_added)
 
     sel_prefix = sel_start + added[:m]
     if sel_prefix:
         sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=device)
-        h_m[sel_t] = -1.0
+        h_mid[sel_t] = -1.0
 
-    cov_m = float(h_m.max().item())
-    return h_m, cov_m
+    return h_mid, float(h_mid.max().item())
 
 
 def reconstruct_hausdorff_with_voronoi(
@@ -79,47 +79,35 @@ def reconstruct_hausdorff_with_voronoi(
     n_snap: int,
     sel_start: List[int],
 ) -> Tuple[Tensor, Tensor]:
-    """Reconstruct h_m and voronoi_m for a bisect-mid prefix.
+    """Rebuild ``(h_mid, voronoi_mid)`` for prefix ``sel_start + added[:m]``.
 
-    Returns (h_m, voronoi_m) where voronoi_m[i] is the index into the
-    simulation's center list (0-based) of the nearest center to point i
-    among sel_start + added[:m].
-
-    Affected points (v_final[i] >= n_snap + m) are those whose nearest
-    center in the full run came from added[m:], so we must re-examine them.
-    Unaffected points' Voronoi assignment in v_final is already valid.
+    Affected points (those whose nearest center in the full forward run came
+    from ``added[m:]``) are recomputed against ``added[:m]`` only; everyone
+    else's ``v_final`` assignment is already valid.
     """
     device = X.device
-    N = X.shape[0]
 
-    # Start from h_final / v_final; we will fix affected points in place
-    h_m = h_final.clone()
-    voronoi_m = v_final.clone()
+    h_mid = h_final.clone()
+    voronoi_mid = v_final.clone()
 
-    # Points whose Voronoi in the full forward run assigned them to a center
-    # that was added AFTER position mid — they need re-examination.
     affected_mask = v_final >= (n_snap + m)
-
     if affected_mask.any():
-        affected_idx = torch.where(affected_mask)[0]  # [n_aff]
+        affected_idx = torch.where(affected_mask)[0]
 
         if m == 0:
-            # No added centers for this mid: fall back fully to snapshot state
-            h_m[affected_idx] = h_snap[affected_idx]
-            voronoi_m[affected_idx] = v_snap[affected_idx]
+            # No new added centers — fall back fully to snapshot state.
+            h_mid[affected_idx] = h_snap[affected_idx]
+            voronoi_mid[affected_idx] = v_snap[affected_idx]
         else:
             added_t = torch.tensor(added[:m], dtype=torch.long, device=device)
-            X_add = X[added_t]  # [m, D]
-            norms_add = norms[added_t]  # [m]
-            n_aff = len(affected_idx)
-            norms_aff = norms[affected_idx]  # [n_aff]
-            X_aff = X[affected_idx]  # [n_aff, D]
+            X_add, norms_add = X[added_t], norms[added_t]
+            X_aff, norms_aff = X[affected_idx], norms[affected_idx]
+            n_aff = affected_idx.numel()
 
-            # Compute distance from each affected point to each of added[:m]
-            # in chunks to avoid OOM
             min_to_added = torch.full((n_aff,), float("inf"), dtype=torch.float32, device=device)
             argmin_to_added = torch.zeros(n_aff, dtype=torch.long, device=device)
 
+            # Chunk the m-axis to cap peak memory.
             chunk = max(1, 10_000_000 // max(n_aff, 1))
             for start in range(0, m, chunk):
                 end = min(start + chunk, m)
@@ -127,25 +115,30 @@ def reconstruct_hausdorff_with_voronoi(
                     norms_aff.unsqueeze(1)
                     + norms_add[start:end].unsqueeze(0)
                     - 2.0 * (X_aff @ X_add[start:end].T)
-                )  # [n_aff, chunk_size]
-                chunk_min_vals, chunk_min_rel = d_chunk.min(dim=1)  # [n_aff] each
-                improve = chunk_min_vals < min_to_added
-                min_to_added = torch.where(improve, chunk_min_vals, min_to_added)
+                )
+                chunk_vals, chunk_rel = d_chunk.min(dim=1)
+                improve = chunk_vals < min_to_added
+                min_to_added = torch.where(improve, chunk_vals, min_to_added)
                 argmin_to_added = torch.where(
-                    improve, torch.tensor(start, device=device) + chunk_min_rel, argmin_to_added
+                    improve,
+                    torch.tensor(start, device=device) + chunk_rel,
+                    argmin_to_added,
                 )
 
-            # For each affected point: take the closer of snapshot or added[:m]
-            snap_closer = h_snap[affected_idx] <= min_to_added
-            h_m[affected_idx] = torch.where(snap_closer, h_snap[affected_idx], min_to_added)
-            voronoi_m[affected_idx] = torch.where(
-                snap_closer, v_snap[affected_idx], n_snap + argmin_to_added
+            # Pick whichever is closer: snapshot's or one of added[:m].
+            snap_vals = h_snap[affected_idx]
+            snap_closer = snap_vals <= min_to_added
+            h_mid[affected_idx] = torch.where(snap_closer, snap_vals, min_to_added)
+            voronoi_mid[affected_idx] = torch.where(
+                snap_closer,
+                v_snap[affected_idx],
+                n_snap + argmin_to_added,
             )
 
-    # Mark all selected prefix points as already-selected in h_m
+    # Mark prefix points as already-selected.
     sel_prefix = sel_start + added[:m]
     if sel_prefix:
         sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=device)
-        h_m[sel_t] = -1.0
+        h_mid[sel_t] = -1.0
 
-    return h_m, voronoi_m
+    return h_mid, voronoi_mid

@@ -1,8 +1,8 @@
 """Single-step Voronoi-accelerated FPS update.
 
-Building block used by :func:`accrete` and :func:`fps_cuda`. Commits one new
-center and updates the Hausdorff array, skipping per-row distance compute for
-points whose nearest center can't have changed (triangle-inequality bound).
+Building block used by :func:`accrete` and :func:`fps_cuda`. Commits one center
+and updates Hausdorff, skipping rows whose nearest center can't have changed
+(triangle inequality).
 """
 
 from __future__ import annotations
@@ -19,20 +19,20 @@ def voronoi_step(
     voronoi: Tensor,
     X_sel: Tensor,
     norms_sel: Tensor,
-    dSL_quarter: Tensor,  # pre-allocated scratch [max_sel] float32
-    d_out_idx: Tensor,  # pre-allocated scratch [1] int32
+    dSL_quarter: Tensor,  # scratch [max_sel] float32
+    d_out_idx: Tensor,  # scratch [1] int32
     new_idx: int,
     sel_pos: int,
 ) -> None:
-    """Sparse update step — fused CUDA kernels, no D2H per step.
+    """Sparse update step — fully fused on device, no per-step D2H sync.
 
-    1. ``commit_center_cuda``: copies X[new_idx] → X_sel[sel_pos],
-       norms[new_idx] → norms_sel[sel_pos], marks hausdorff[new_idx]=-1,
-       voronoi[new_idx]=sel_pos. All on-device.
-    2. ``compute_dSL_quarter_cuda``: dSL_quarter[v] = dist(X_sel[v], x_new)/4
-       for v in [0, sel_pos) — replaces the per-step GEMV + 3 elementwise ops.
-    3. ``voronoi_update_cuda`` / ``fps_update_cuda``: Voronoi-skip Hausdorff
-       update over N rows.
+    Three kernels:
+      1. ``commit_center_cuda`` — copy X[new_idx]→X_sel[sel_pos], mark
+         hausdorff[new_idx]=-1, voronoi[new_idx]=sel_pos.
+      2. ``compute_dSL_quarter_cuda`` — dSL_quarter[v] = ||X_sel[v]-x_new||²/4
+         for v < sel_pos. Replaces a per-step GEMV + 3 elementwise ops.
+      3. ``voronoi_update_cuda`` (or ``fps_update_cuda`` at sel_pos==0) —
+         Voronoi-skip Hausdorff update over all rows.
     """
     ensure_compiled()
     ext = get_ext()
@@ -40,10 +40,10 @@ def voronoi_step(
     ext.commit_center_cuda(X, norms, X_sel, norms_sel, hausdorff, voronoi, d_out_idx, sel_pos)
 
     x_new = X_sel[sel_pos]
-    norm_new_t = norms_sel[sel_pos : sel_pos + 1]
+    norm_new = norms_sel[sel_pos : sel_pos + 1]
 
     if sel_pos == 0:
-        ext.fps_update_cuda(X, norms, x_new, hausdorff, voronoi, norm_new_t, 0)
+        ext.fps_update_cuda(X, norms, x_new, hausdorff, voronoi, norm_new, 0)
     else:
         ext.compute_dSL_quarter_cuda(X_sel, norms_sel, dSL_quarter, sel_pos)
         ext.voronoi_update_cuda(
@@ -53,6 +53,6 @@ def voronoi_step(
             dSL_quarter[:sel_pos],
             hausdorff,
             voronoi,
-            norm_new_t,
+            norm_new,
             sel_pos,
         )

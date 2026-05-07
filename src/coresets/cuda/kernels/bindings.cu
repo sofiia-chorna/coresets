@@ -1,14 +1,10 @@
-// kernels/bindings.cu — split out from the original kernels.cu.
+// kernels/bindings.cu — pybind11 export of every C++ wrapper.
 #include "_shared.cuh"
 
-// ===========================================================================
-// 9. pybind11 bindings
-// ===========================================================================
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "Voronoi-accelerated FPS CUDA kernels for coreset computation";
+    m.doc() = "Voronoi-accelerated FPS CUDA kernels for coreset construction";
 
-    // Export the argmax block count so Python scratch allocation stays in sync
+    // Exported so Python-side scratch allocation stays in sync with the kernel.
     m.attr("MAX_ARGMAX_BLOCKS") = MAX_ARGMAX_BLOCKS;
 
     m.def("fps_update_cuda", &fps_update_cuda,
@@ -95,7 +91,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("points_left"), py::arg("shard_offset"), py::arg("N_shard"),
           py::arg("world_size"), py::arg("pg"));
 
-    // --- 8d/8e: sharded-X multi-GPU ------------------------------------------
+    // --- Sharded-X multi-GPU ------------------------------------------------
 
     m.def("pack_argmax_with_row_cuda", &pack_argmax_with_row_cuda,
           "Pack (val, global_idx_bitcast, norm, row) into argmax_local_pack[3+D]. "

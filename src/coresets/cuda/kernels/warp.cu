@@ -1,10 +1,9 @@
 // kernels/warp.cu — dense + Voronoi-skip Hausdorff-update kernels.
 #include "_shared.cuh"
 
-// One warp computes a D-element dot product between row_ptr and x_new_smem.
-// Lane k handles every 32nd coordinate; result is 32 partial sums (caller
-// reduces). Float4 path on D%4==0; scalar otherwise. __ldg routes the global
-// load through the read-only cache, leaving L1 for writes.
+// One warp dot-products row_ptr · x_new_smem (D coords). Lane k handles
+// every 32nd coord; caller reduces the 32 partials. Float4 fast-path on
+// D%4==0. __ldg routes the global load through the read-only cache.
 template <typename scalar_t>
 __device__ __forceinline__ float warp_dot(const scalar_t* __restrict__ row_ptr,
                                           const scalar_t* __restrict__ x_new_smem,  // shared mem
@@ -31,9 +30,9 @@ __device__ __forceinline__ float warp_dot(const scalar_t* __restrict__ row_ptr,
     return dot;
 }
 
-// Dense Hausdorff update: for each row, recompute d² and tighten h/voronoi.
+// Dense Hausdorff update: recompute d² for every row, tighten h/voronoi.
 // Used at step 0 and as the fallback when no Voronoi skip is set up.
-// Launch: <<<ceil(N/8), 256, D·sizeof(scalar_t)>>>  (8 warps/block, x_new in smem).
+// Launch: <<<ceil(N/8), 256, D·sizeof(scalar_t)>>> — 8 warps/block, x_new in smem.
 template <typename scalar_t>
 __global__ void fps_update_warp_kernel(const scalar_t* __restrict__ X,
                                        const float* __restrict__ norms,
@@ -73,11 +72,10 @@ __global__ void fps_update_warp_kernel(const scalar_t* __restrict__ X,
     }
 }
 
-// Voronoi-skip variant: skip rows where dSL_quarter[v(row)] >= h(row), since
-// the triangle-inequality bound proves the update can't improve. ~80–95% of
-// rows skip at high n_sel — the dominant speedup over the dense kernel.
-// dSL_quarter[v] = 0.25 · ||X_sel[v] - x_new||² is computed once per step
-// by compute_dSL_quarter_kernel.
+// Voronoi-skip: triangle-inequality bound (dSL_quarter[v] >= h) proves the
+// update can't improve, so we skip the dot. ~80–95% of rows skip at high
+// n_sel — the dominant speedup over the dense kernel. dSL_quarter[v] =
+// 0.25·||X_sel[v]-x_new||² is computed once per step by compute_dSL_quarter.
 template <typename scalar_t>
 __global__ void voronoi_update_warp_kernel(
     const scalar_t* __restrict__ X, const float* __restrict__ norms,
@@ -100,7 +98,7 @@ __global__ void voronoi_update_warp_kernel(
     if (h < 0)
         return;
 
-    // All 32 lanes read the same dSL_quarter[v] — uniform branch, no divergence.
+    // Uniform branch across the warp — same dSL_quarter[v] read on all lanes.
     int64_t v = __ldg(&voronoi[row]);
     if (__ldg(&dSL_quarter[v]) >= h)
         return;

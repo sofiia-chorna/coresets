@@ -1,12 +1,10 @@
 """Farthest Point Sampling — pure-torch implementations.
 
-  - :func:`fps`         — TorchScript, plain FPS via ``torch.mv``.
-                          Sufficient for anchors up to a few million points.
-  - :func:`voronoi_fps` — TorchScript, Voronoi-accelerated FPS using torch ops.
-  - :func:`fps_update`  — TorchScript single-step Hausdorff update primitive.
+  fps         — plain FPS via ``torch.mv``. OK up to a few M points.
+  voronoi_fps — Voronoi-accelerated FPS (torch ops).
+  fps_update  — single-step Hausdorff update primitive.
 
-For very large N (≳ a few million) and high D, see :func:`coresets.fps_cuda`,
-which uses custom warp-per-row CUDA kernels for the per-step Hausdorff update.
+For very large N + high D see :func:`coresets.fps_cuda` (custom kernels).
 """
 
 from typing import Optional, Tuple
@@ -25,11 +23,9 @@ def fps_update(
     new_idx: int,
     sel_idx: int,
 ) -> None:
-    """Single FPS step: compute distances from point new_idx, update state in-place.
+    """One FPS step (in-place): updates hausdorff/voronoi from point ``new_idx``.
 
-    After this call, ``hausdorff`` holds min squared distances to the selected
-    set (including new_idx), ``voronoi`` holds nearest-selected-point indices,
-    and ``hausdorff[new_idx]`` is set to -1 (excluded from future selection).
+    Marks ``hausdorff[new_idx] = -1`` so it can't be picked again.
     """
     d.copy_(norms).add_(norms[new_idx])
     torch.addmv(d, X, X[new_idx], beta=1, alpha=-2, out=d)
@@ -45,28 +41,15 @@ def fps(
     n_to_select: int,
     selected_idx: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Standard Farthest Point Sampling (torch).
+    """Standard FPS.
 
-    Parameters
-    ----------
-    X : Tensor (N, D)
-        Descriptor matrix (one row per sample).
-    n_to_select : int
-        Total number of points in the final selection (including any
-        pre-selected points).
-    selected_idx : Tensor (M,), optional
-        Indices of already-selected points.  If None, starts from index 0.
+    Returns ``(selected, epsilons, hausdorff, voronoi)``:
+      selected  : (n_to_select,) int64, in selection order
+      epsilons  : (n_to_select,) FPS radii (max distance just before each pick)
+      hausdorff : (N,) min squared distance to the selected set
+      voronoi   : (N,) int64 — index into ``selected`` of each row's nearest pick
 
-    Returns
-    -------
-    sel : Tensor (n_to_select,) int64
-        Selected indices, in order of selection.
-    epsilons : Tensor (n_to_select,)
-        FPS radii at each step (max distance just before each pick).
-    hausdorff : Tensor (N,)
-        Min squared distance from each point to the selected set.
-    voronoi : Tensor (N,) int64
-        Index (into sel) of the nearest selected point for each sample.
+    ``selected_idx`` (M,) seeds the first M picks; defaults to ``[0]``.
     """
     N = X.shape[0]
     norms = (X * X).sum(dim=1)
@@ -107,17 +90,15 @@ def voronoi_fps(
     selected_idx: Optional[Tensor] = None,
     full_fraction: float = 0.5,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Voronoi-accelerated Farthest Point Sampling (torch).
+    """Voronoi-accelerated FPS (torch).
 
-    Uses the triangle inequality to skip distance computations for points
-    that are guaranteed to stay in their current Voronoi cell.  When the
-    active fraction is small, only computes distances for those points,
-    avoiding the O(N*D) matmul entirely.  Falls back to a full computation
-    when the active fraction exceeds ``full_fraction``.
+    Triangle inequality skips the per-row distance compute for points that
+    can't change Voronoi cell. When the active fraction is small the inner
+    loop avoids the O(N·D) matmul entirely; falls back to the full pass once
+    the active fraction exceeds ``full_fraction``.
 
-    The speedup over plain :func:`fps` grows with D since the pruned matmul
-    savings scale as O(N*D) while the Voronoi bookkeeping is O(N).  For
-    small D (say <64), plain :func:`fps` is faster.
+    Speedup over plain ``fps`` grows with D. For small D (≲ 64), plain
+    ``fps`` is faster (Voronoi bookkeeping outweighs the matmul saved).
     """
     N = X.shape[0]
     D = X.shape[1]
@@ -155,9 +136,8 @@ def voronoi_fps(
         x_new = X_sel[i]
         norm_new = norms_sel[i]
 
-        # Triangle-inequality bound: a point in cell j can only switch to
-        # the new cell if dSL[j]/4 < hausdorff[x]. If no point qualifies,
-        # skip the O(N*D) distance computation entirely.
+        # Triangle bound: a point in cell j can switch only if dSL[j]/4 < h[x].
+        # If no point qualifies we skip the O(N·D) distance pass entirely.
         dSL_quarter = (norms_sel[:i] + norm_new - 2.0 * (X_sel[:i] @ x_new)) * 0.25
         active_mask = dSL_quarter[voronoi] < hausdorff
 

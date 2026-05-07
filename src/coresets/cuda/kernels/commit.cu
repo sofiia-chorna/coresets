@@ -1,8 +1,8 @@
 // kernels/commit.cu — center-commit + Voronoi-skip-bound kernels.
 #include "_shared.cuh"
 
-// Basic commit: copy X[best_idx] into X_sel[n_sel], record norm, mark
-// h_m[best_idx]=-1 (already-selected), voronoi_m[best_idx]=n_sel.
+// Basic commit: X[best]→X_sel[n_sel], record norm, mark h_m[best]=-1 and
+// voronoi_m[best]=n_sel. Caller passes best_idx via a 1-elt device tensor.
 template <typename scalar_t>
 __global__ void commit_center_kernel(const scalar_t* __restrict__ X,
                                      const float* __restrict__ norms, scalar_t* X_sel,
@@ -21,9 +21,9 @@ __global__ void commit_center_kernel(const scalar_t* __restrict__ X,
         dst[i] = src[i];
 }
 
-// Commit + on-device sep update + viability flag. Eliminates per-step D2H
-// in simulate_fps_voronoi. Viability test: if the previous local_sep already
-// exceeded max(h), no future step can violate sep > cov, so set d_viable=1.
+// Commit + on-device sep update + viability flag (kills per-step D2H inside
+// simulate_fps_voronoi). Viability: if the prior local_sep already exceeded
+// max(h), no future step can violate sep > cov → set d_viable=1.
 template <typename scalar_t>
 __global__ void commit_center_with_sep_kernel(const scalar_t* __restrict__ X,
                                               const float* __restrict__ norms, scalar_t* X_sel,
@@ -38,9 +38,9 @@ __global__ void commit_center_with_sep_kernel(const scalar_t* __restrict__ X,
         float bv = *d_best_val;
         float sep = *d_local_sep;
         if (sep > bv)
-            *d_viable = 1;  // previous sep already beats current max(h) → viable
+            *d_viable = 1;  // prior sep already beats current max(h) → viable
         if (bv < sep)
-            *d_local_sep = bv;  // running min
+            *d_local_sep = bv;  // running-min update
         norms_sel[n_sel] = norms[best_idx];
         h_m[best_idx] = -1.0f;
         voronoi_m[best_idx] = n_sel;
@@ -85,9 +85,9 @@ __global__ void compute_dSL_quarter_kernel(const scalar_t* __restrict__ X_sel,
     }
 }
 
-// active_mask[v] = 1 iff some unselected row i has voronoi_m[i] == v.
-// Caller must zero active_mask first. Lets compute_dSL_quarter_masked skip
-// dead Voronoi cells where the dSL bound is never read.
+// active_mask[v] = 1 iff some unselected row points to center v.
+// Caller pre-zeroes the mask. Lets compute_dSL_quarter_masked skip dead
+// Voronoi cells whose dSL bound nobody reads.
 __global__ void mark_active_centers_kernel(const float* __restrict__ h_m,
                                            const int64_t* __restrict__ voronoi_m,
                                            int* __restrict__ active_mask, const int N) {
@@ -98,7 +98,7 @@ __global__ void mark_active_centers_kernel(const float* __restrict__ h_m,
 }
 
 // Same as compute_dSL_quarter_kernel but skips centers with active_mask==0.
-// 30–80% rows skipped at high n_sel — proportional bandwidth win.
+// Skips 30–80% of rows at high n_sel — proportional bandwidth win.
 template <typename scalar_t>
 __global__ void compute_dSL_quarter_masked_kernel(const scalar_t* __restrict__ X_sel,
                                                   const float* __restrict__ norms_sel,
@@ -120,7 +120,7 @@ __global__ void compute_dSL_quarter_masked_kernel(const scalar_t* __restrict__ X
         return;
 
     if (!__ldg(&active_mask[row]))
-        return;  // uniform read across the warp, no divergence
+        return;  // uniform across the warp, no divergence
 
     float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
 

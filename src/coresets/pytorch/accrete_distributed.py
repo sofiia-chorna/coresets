@@ -1,16 +1,7 @@
-"""Multi-GPU coreset operations.
+"""Multi-GPU pure-torch coreset accretion (reference implementation).
 
-Usage (launch with ``torchrun --nproc_per_node=G``):
-
-    import torch.distributed as dist
-    dist.init_process_group("nccl")
-    rank, world_size = dist.get_rank(), dist.get_world_size()
-
-    # Each rank loads its shard of X_union = cat(X_A, X_C)
-    X_local = load_shard(rank, world_size).cuda()
-
-    result = accrete(X_local, idx_A, N_A, rank, world_size)
-    # result is identical on all ranks
+Launch with ``torchrun --nproc_per_node=G``. X is sharded across GPUs;
+hausdorff / voronoi / X_sel are replicated.
 """
 
 import math
@@ -21,15 +12,6 @@ import torch.distributed as dist
 from torch import Tensor
 
 from .distributed_state import DistributedFPSState
-
-# -----------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------
-
-
-# -----------------------------------------------------------------------
-# Voronoi-accelerated accretion (distributed)
-# -----------------------------------------------------------------------
 
 
 def _voronoi_step_dist(
@@ -42,11 +24,10 @@ def _voronoi_step_dist(
     sel_pos: int,
     full_threshold: int,
 ) -> None:
-    """Distributed voronoi-accelerated FPS step.
+    """Distributed Voronoi-accelerated FPS step.
 
-    Triangle inequality check uses replicated X_sel / norms_sel (no comm).
-    Distance computation uses the distributed state (broadcast + allgather).
-    When no points are active, skips the distance computation entirely.
+    Triangle-inequality check uses replicated X_sel/norms_sel (no comm).
+    Distance compute uses the distributed state (broadcast + allgather).
     """
     center = state.broadcast_descriptor(global_idx)
     norm_new = (center * center).sum()
@@ -61,7 +42,7 @@ def _voronoi_step_dist(
         h[global_idx] = -1.0
         return
 
-    # Triangle inequality (replicated, no communication)
+    # Triangle-inequality bound (replicated, no comm).
     dSL_quarter = (norms_sel[:sel_pos] + norm_new - 2.0 * (X_sel[:sel_pos] @ center)) * 0.25
     vl_clamped = torch.clamp(v, max=sel_pos - 1)
     active_mask = dSL_quarter[vl_clamped] < h
@@ -74,13 +55,11 @@ def _voronoi_step_dist(
     n_active = int(active_mask.sum().item())
 
     if n_active <= full_threshold:
-        # Sparse: compute distances only for active rows
         d = state.compute_distances_sparse(center, active_mask)
         closer = (d < h) & active_mask
         h[closer] = d[closer]
         v.masked_fill_(closer, sel_pos)
     else:
-        # Full distance computation
         d = state.compute_distances(center)
         closer = d < h
         v.masked_fill_(closer, sel_pos)
@@ -102,11 +81,7 @@ def _reconstruct_hausdorff_dist(
     n_snap: int,
     sel_start: List[int],
 ) -> Tuple[Tensor, float]:
-    """Reconstruct hausdorff at prefix *m* of a restricted FPS run.
-
-    Uses X_sel (replicated) for added-point descriptors, and distributes
-    the distance computation for affected points across ranks.
-    """
+    """Reconstruct hausdorff at prefix *m*. Distributes affected-point compute."""
     device = state.device
     N = state.N
     affected = v_final >= (n_snap + m)
@@ -120,7 +95,7 @@ def _reconstruct_hausdorff_dist(
         if m == 0:
             h_m[affected_idx] = h_snap[affected_idx]
         else:
-            # Added-point descriptors from X_sel (replicated — no communication)
+            # X_sel is replicated; no comm needed for added-point descriptors.
             X_add = X_sel[n_snap : n_snap + m]
             norms_add = norms_sel[n_snap : n_snap + m]
 
@@ -132,7 +107,7 @@ def _reconstruct_hausdorff_dist(
                 device=device,
             )
 
-            # Each rank computes distances for its local affected rows
+            # Each rank handles its in-shard affected rows.
             local_mask = (affected_idx >= state.my_offset) & (
                 affected_idx < state.my_offset + state.n_local
             )
@@ -166,12 +141,9 @@ def _reconstruct_hausdorff_dist(
                 local_positions = torch.where(local_mask)[0]
                 min_to_added[local_positions] = min_local
 
-            # Combine across ranks
             dist.all_reduce(min_to_added, op=dist.ReduceOp.MIN)
-
             h_m[affected_idx] = torch.minimum(h_snap[affected_idx], min_to_added)
 
-    # Mask selected points
     sel_prefix = sel_start + added[:m]
     sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=device)
     h_m[sel_t] = -1.0
@@ -193,7 +165,7 @@ def _bisect_voronoi_dist(
     total_budget: int,
     n_snap: int,
 ) -> int:
-    """Binary search for max viable prefix using voronoi-based reconstruction."""
+    """Binary-search the max viable prefix via Voronoi reconstruction."""
     N = state.N
     device = state.device
     low, high, best = 0, len(added), 0
@@ -224,7 +196,7 @@ def _bisect_voronoi_dist(
             sel_start,
         )
 
-        # Fast path: kth-value bound (replicated h_m, no communication)
+        # Fast path: kth-value bound (h_m is replicated; no comm).
         n_positive = int((h_m >= 0).sum().item())
         if points_left > 0 and points_left < n_positive:
             rank_k = n_positive - points_left
@@ -239,7 +211,7 @@ def _bisect_voronoi_dist(
             low = mid + 1
             continue
 
-        # Slow path: simulate unrestricted FPS (distributed updates)
+        # Slow path: simulate the unrestricted FPS fill (distributed updates).
         local_sep = sep_mid
         n_sel = len(sel_start) + mid
         is_viable = False
@@ -276,31 +248,11 @@ def accrete(
     max_k: Optional[int] = None,
     verbose: bool = True,
 ) -> Tensor:
-    """Multi-GPU voronoi-accelerated accretion with coverage guarantees.
+    """Multi-GPU Voronoi-accelerated accretion (distributed reference).
 
-    Distributed version of ``coreset.accrete``.  X is sharded
-    across GPUs; hausdorff / voronoi / X_sel are replicated.
-
-    Parameters
-    ----------
-    X_local : Tensor (n_local, D)
-        This rank's contiguous shard of ``X_union = cat(X_A, X_C)``.
-    anchor_order : Tensor (n_anchor,) int64
-        FPS ordering for A (global indices in ``[0, n_anchor)``).
-        Must be identical on all ranks.
-    n_anchor : int
-        Number of points in dataset A.
-    rank, world_size : int
-        Process rank and total number of processes.
-    max_k : int, optional
-        Maximum level (default: floor(log2(N))).
-    verbose : bool
-        Print per-level progress (rank 0 only).
-
-    Returns
-    -------
-    Tensor (2^max_k,) int64
-        Coreset sequence over A + C (identical on all ranks).
+    Same coverage guarantee as ``pytorch.accrete``. X sharded across GPUs;
+    hausdorff/voronoi/X_sel replicated. Returns ``(2^max_k,) int64`` global
+    coreset indices, identical on every rank.
     """
     state = DistributedFPSState(X_local, rank, world_size)
     N = state.N
@@ -312,24 +264,19 @@ def accrete(
         max_k = int(math.log2(N))
 
     target = anchor_order.tolist()
+    nested_blocks: List[Set[int]] = [
+        set(target[: min(2**i, n_anchor)]) for i in range(1, max_k + 1)
+    ]
 
-    # Nested target sets from A
-    nested_blocks: List[Set[int]] = []
-    for i in range(1, max_k + 1):
-        nested_blocks.append(set(target[: min(2**i, n_anchor)]))
-
-    # Replicated state — carried forward across levels
     hausdorff = torch.full((N,), float("inf"), dtype=dtype, device=device)
     voronoi = torch.zeros(N, dtype=torch.long, device=device)
 
-    # Replicated selected-descriptor buffer for voronoi acceleration
     max_sel = 2**max_k
     X_sel = torch.empty((max_sel, D), dtype=dtype, device=device)
     norms_sel = torch.empty(max_sel, dtype=dtype, device=device)
 
-    full_threshold = int(0.5 * N)  # voronoi acceleration crossover; internal default
+    full_threshold = int(0.5 * N)  # Voronoi/full-pass crossover; production default
 
-    # Initialize with first A point
     first = target[0]
     current_sel: List[int] = [first]
     selected_set: Set[int] = {first}
@@ -487,15 +434,9 @@ def accrete(
             )
             points_needed -= 1
 
-        # End-of-level invariant check + numeric rel_gap diagnostic.
-        # hausdorff is replicated across ranks here (only X is sharded), so
-        # hausdorff.max() is identical on every rank -- no NCCL needed.
-        # Hard abort on gross violation (rel_gap < -1e-3); print rel_gap.
+        # End-of-level Gonzalez invariant. hausdorff is replicated → no NCCL.
         GROSS_VIOLATION_REL = 1e-3
-
-        cov_sq = float(hausdorff.max().item())
-        if cov_sq < 0.0:
-            cov_sq = 0.0
+        cov_sq = max(0.0, float(hausdorff.max().item()))
         sep_sq = current_sep
         sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
         cov_val = math.sqrt(cov_sq)
@@ -505,10 +446,9 @@ def accrete(
 
         if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_VIOLATION_REL):
             raise RuntimeError(
-                f"accrete (distributed): sep > cov violated at level k={k} "
+                f"accrete (distributed): sep > cov violated at k={k} "
                 f"(size={target_size}): sep={sep_val:.8e}, cov={cov_val:.8e}, "
-                f"sep^2={sep_sq:.8e}, cov^2={cov_sq:.8e}, rel_gap={rel_gap:.3e}. "
-                f"Gross violation, not float noise."
+                f"rel_gap={rel_gap:.3e}. Gross violation, not float noise."
             )
 
         if verbose and rank == 0:

@@ -1,9 +1,9 @@
-// kernels/simulate.cu — single-GPU FPS simulation loop, zero D2H per step.
+// kernels/simulate.cu — single-GPU FPS sim loop, zero D2H per step.
 #include "_shared.cuh"
 
-// One bisect probe = one call: starting from (h, v) with n_init centers,
-// can we add `points_left` FPS points while keeping min separation ≥ sep?
-// Per step: argmax → commit + sep update → dSL_quarter → voronoi_update.
+// One bisect probe = one call. Starting from (h, v) with n_init centers,
+// can we add ``points_left`` more picks while keeping min separation ≥ sep?
+// Per step: argmax → commit-with-sep → dSL_quarter → voronoi_update.
 // Only D2H is a 4-byte d_viable read every 16 steps (early-exit signal).
 // Returns (is_viable, steps_used).
 
@@ -44,8 +44,8 @@ std::tuple<bool, int64_t> simulate_fps_voronoi(
         commit_center_with_sep_cuda(X, norms, X_sel, norms_sel, h_m, voronoi_m, d_out_idx,
                                     d_out_val, d_local_sep, d_viable, n_sel);
 
-        // Masked dSL pays for itself when dSL bandwidth exceeds scan cost:
-        // n_sel × D × 4 > N × 12  ⇒  n_sel × D > N × 3.
+        // Masked dSL pays for itself when dSL bandwidth > scan cost:
+        // n_sel·D·4 > N·12  ⇒  n_sel·D > N·3.
         if (n_sel > 0) {
             bool use_mask = ((int64_t) n_sel * D > (int64_t) N * 3);
             if (use_mask) {
@@ -76,8 +76,8 @@ std::tuple<bool, int64_t> simulate_fps_voronoi(
         }
     }
 
-    // C1: post-loop viability check. The in-loop check tests sep > max(h)
-    // before the final update; this catches the post-final-update case.
+    // C1: post-loop viability check (the in-loop test reads max(h) *before*
+    // the final update; this catches the post-update case).
     argmax_cuda(h_m, block_vals, block_idxs, d_out_val, d_out_idx, (int64_t) N);
     final_viable_check_kernel<<<1, 1>>>(d_out_val.data_ptr<float>(), d_local_sep.data_ptr<float>(),
                                         d_viable.data_ptr<int>());

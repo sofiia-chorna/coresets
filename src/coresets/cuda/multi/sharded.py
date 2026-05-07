@@ -1,19 +1,17 @@
 """Multi-GPU FPS-accretion with X **sharded** across ranks.
 
-Production path for N up to ~1 B at D=512, G=8-64 H100s. Each rank holds only
-its slice of the global feature matrix; per-step collective is one AllGather of
-``(value, idx, norm, row)`` per rank.
+Production path. Each rank holds only its slice of the global feature matrix;
+per-step collective is one AllGather of ``(value, idx, norm, row)``.
 
 Public:
-    accrete_sharded                 — recommended entry point (auto-discovers layout)
-    accrete_voronoi_multi_sharded   — underlying implementation (verbose API)
+  accrete_sharded                 — recommended entry point (auto-discovers layout)
+  accrete_voronoi_multi_sharded   — underlying implementation (verbose API)
 """
 
 from __future__ import annotations
 
 import math
 import os
-import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -21,8 +19,14 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from .._diag import PhaseTimer, Tracer
 from ..ext import ensure_compiled, get_ext
-from .layout import _compute_shard_layout, _owner_of
+from ._shared import reconstruct_hausdorff_with_voronoi_multi
+from .layout import ShardLayout
+
+# ---------------------------------------------------------------------------
+# AllGather "by owner" — used for fixed-index commits (seed + replay)
+# ---------------------------------------------------------------------------
 
 
 def _pack_row_by_owner(
@@ -30,39 +34,35 @@ def _pack_row_by_owner(
     norms_local: Tensor,
     global_idx: int,
     owner_rank: int,
-    shard_offset: int,
-    N_shard: int,
+    layout: ShardLayout,
     local_pack: Tensor,
     gather_buf: Tensor,
-    world_size: int,
-    D: int,
-    my_rank: int,
+    dim: int,
 ) -> None:
     """AllGather a pack where only ``owner_rank``'s slot carries real data.
 
-    Used for Python-side fixed-index commits (initial seed, replay): the
-    winning row isn't the result of an argmax call, so we synthesise a pack
-    with val=0 / global_idx set on the owner, -inf on others, then reuse
-    the same gather_buf downstream (``_voronoi_step_multi_sharded`` reads
-    row/norm from gather_buf at slot ``owner_rank``).
+    For Python-side fixed-index commits the row isn't the result of an argmax,
+    so we synthesise a pack with val=0 / global_idx set on the owner and -inf
+    on the others. Downstream ``_voronoi_step_multi_sharded`` then reads the
+    row + norm from ``gather_buf`` at slot ``owner_rank``.
     """
-    local_pack_i = local_pack.view(torch.int32)
-    if my_rank == owner_rank:
-        local_idx = global_idx - shard_offset
+    pack_i = local_pack.view(torch.int32)
+    if layout.rank == owner_rank:
+        local_idx = layout.to_local(global_idx)
         local_pack[0] = 0.0  # val slot unused downstream
-        local_pack_i[1] = int(global_idx)
+        pack_i[1] = int(global_idx)
         local_pack[2] = norms_local[local_idx].to(torch.float32)
-        local_pack[3 : 3 + D] = X_local[local_idx].to(torch.float32)
+        local_pack[3 : 3 + dim] = X_local[local_idx].to(torch.float32)
     else:
         local_pack[0] = float("-inf")
-        local_pack_i[1] = -1
+        pack_i[1] = -1
         local_pack[2] = 0.0
-        local_pack[3 : 3 + D] = 0.0
+        local_pack[3 : 3 + dim] = 0.0
     dist.all_gather_into_tensor(gather_buf, local_pack)
 
 
 # ---------------------------------------------------------------------------
-# Sharded argmax (unrestricted and restricted) — AllGather-with-row
+# Sharded argmax (unrestricted + restricted) — AllGather-with-row
 # ---------------------------------------------------------------------------
 
 
@@ -70,46 +70,42 @@ def _argmax_global_sharded(
     h_shard: Tensor,
     X_local: Tensor,
     norms_local: Tensor,
-    shard_offset: int,
-    N_shard: int,
+    layout: ShardLayout,
     block_vals: Tensor,
     block_idxs: Tensor,
     d_out_val: Tensor,
     d_out_idx: Tensor,
     local_pack: Tensor,
     gather_buf: Tensor,
-    world_size: int,
-    D: int,
+    dim: int,
 ) -> Tuple[float, int, int]:
-    """Global argmax over sharded h_shard via a single AllGather-with-row.
+    """Global argmax over ``h_shard`` via one AllGather-with-row.
 
-    Returns ``(best_val, best_global_idx, winner_rank)``.  After this call,
+    Returns ``(best_val, best_global_idx, winner_rank)``. After the call,
     ``gather_buf[winner_rank * (3 + D) + 3 : + 3 + D]`` holds the winning
-    row and ``[+2]`` holds its norm — see ``_voronoi_step_multi_sharded``.
+    row and slot ``[+2]`` holds its norm — see ``_voronoi_step_multi_sharded``.
     """
     ext = get_ext()
-    stride = 3 + D
+    stride = 3 + dim
 
-    if N_shard > 0:
-        ext.argmax_cuda(h_shard, block_vals, block_idxs, d_out_val, d_out_idx, N_shard)
+    if layout.N_shard > 0:
+        ext.argmax_cuda(h_shard, block_vals, block_idxs, d_out_val, d_out_idx, layout.N_shard)
         ext.pack_argmax_with_row_cuda(
             X_local,
             norms_local,
             d_out_val,
             d_out_idx,
-            int(shard_offset),
+            int(layout.shard_offset),
             local_pack,
         )
     else:
-        ext.fill_pack_with_row_neg_inf_cuda(local_pack, int(D))
+        ext.fill_pack_with_row_neg_inf_cuda(local_pack, int(dim))
 
     dist.all_gather_into_tensor(gather_buf, local_pack)
-
-    gb_2d = gather_buf.view(world_size, stride)
-    vals = gb_2d[:, 0]
-    winner = int(torch.argmax(vals).item())
-    best_val = float(vals[winner].item())
-    best_idx = int(gb_2d.view(torch.int32)[winner, 1].item())
+    gb = gather_buf.view(layout.world_size, stride)
+    winner = int(torch.argmax(gb[:, 0]).item())
+    best_val = float(gb[winner, 0].item())
+    best_idx = int(gb.view(torch.int32)[winner, 1].item())
     return best_val, best_idx, winner
 
 
@@ -118,47 +114,46 @@ def _restricted_argmax_global_sharded(
     h_shard: Tensor,
     X_local: Tensor,
     norms_local: Tensor,
-    shard_offset: int,
-    N_shard: int,
+    layout: ShardLayout,
     local_pack: Tensor,
     gather_buf: Tensor,
-    world_size: int,
-    D: int,
+    dim: int,
 ) -> Tuple[float, int, int]:
-    """Sharded variant of _restricted_argmax_global — packs the winning row."""
-    stride = 3 + D
-    local_pack_i = local_pack.view(torch.int32)
+    """Sharded variant of restricted-argmax — also packs the winning row."""
+    stride = 3 + dim
+    pack_i = local_pack.view(torch.int32)
 
-    local_mask = (pool_global >= shard_offset) & (pool_global < shard_offset + N_shard)
-    local_pool_global = pool_global[local_mask]
-    if local_pool_global.numel() > 0:
-        local_local_idx = local_pool_global - shard_offset
-        h_local = h_shard[local_local_idx]
+    in_shard = (pool_global >= layout.shard_offset) & (
+        pool_global < layout.shard_offset + layout.N_shard
+    )
+    local_pool = pool_global[in_shard]
+    if local_pool.numel() > 0:
+        local_idx = local_pool - layout.shard_offset
+        h_local = h_shard[local_idx]
         lv, li = torch.max(h_local, dim=0)
-        best_local_t = local_local_idx[li]  # 0-d long
-        best_global_t = local_pool_global[li].to(torch.int32)  # 0-d int32
-        # Stay on device — avoid per-step .item() sync.
+        winner_local = local_idx[li]
+        winner_global = local_pool[li].to(torch.int32)
+        # Stay on device to avoid per-step .item() sync.
         local_pack[0] = lv.to(torch.float32)
-        local_pack_i[1] = best_global_t
-        local_pack[2] = norms_local[best_local_t].to(torch.float32)
-        local_pack[3 : 3 + D] = X_local[best_local_t].to(torch.float32)
+        pack_i[1] = winner_global
+        local_pack[2] = norms_local[winner_local].to(torch.float32)
+        local_pack[3 : 3 + dim] = X_local[winner_local].to(torch.float32)
     else:
         local_pack[0] = float("-inf")
-        local_pack_i[1] = -1
+        pack_i[1] = -1
         local_pack[2] = 0.0
-        local_pack[3 : 3 + D] = 0.0
+        local_pack[3 : 3 + dim] = 0.0
 
     dist.all_gather_into_tensor(gather_buf, local_pack)
-    gb_2d = gather_buf.view(world_size, stride)
-    vals = gb_2d[:, 0]
-    winner = int(torch.argmax(vals).item())
-    best_val = float(vals[winner].item())
-    best_idx = int(gb_2d.view(torch.int32)[winner, 1].item())
+    gb = gather_buf.view(layout.world_size, stride)
+    winner = int(torch.argmax(gb[:, 0]).item())
+    best_val = float(gb[winner, 0].item())
+    best_idx = int(gb.view(torch.int32)[winner, 1].item())
     return best_val, best_idx, winner
 
 
 # ---------------------------------------------------------------------------
-# Sharded voronoi-step (commit + Hausdorff update)
+# Voronoi step — commit using the row already in gather_buf
 # ---------------------------------------------------------------------------
 
 
@@ -174,34 +169,29 @@ def _voronoi_step_multi_sharded(
     new_global_idx: int,
     sel_pos: int,
     winner_rank: int,
-    shard_offset: int,
-    N_shard: int,
+    layout: ShardLayout,
     owner_rank: int,
-    my_rank: int,
-    D: int,
+    dim: int,
 ) -> None:
-    """Commit a new center using the row carried in ``gather_buf``.
+    """Commit the new center using the row carried in ``gather_buf``.
 
-    ``winner_rank`` is the slot in gather_buf that holds the winning row.
-    For argmax-driven commits it comes from ``_argmax_global_sharded``
-    etc.; for fixed-index commits it is ``owner_rank`` after a prior
-    call to ``_pack_row_by_owner``.
+    ``winner_rank`` is the slot that holds the winning row — comes from an
+    argmax helper, or equals ``owner_rank`` after ``_pack_row_by_owner``.
     """
     ext = get_ext()
-    stride = 3 + D
+    stride = 3 + dim
     base = winner_rank * stride
 
-    win_row = gather_buf[base + 3 : base + 3 + D]
-    X_sel[sel_pos].copy_(win_row)
+    X_sel[sel_pos].copy_(gather_buf[base + 3 : base + 3 + dim])
     norms_sel[sel_pos] = gather_buf[base + 2]
 
-    if my_rank == owner_rank:
-        local_idx = new_global_idx - shard_offset
+    if layout.rank == owner_rank:
+        local_idx = layout.to_local(new_global_idx)
         hausdorff_shard[local_idx] = -1.0
         voronoi_shard[local_idx] = sel_pos
 
     x_new = X_sel[sel_pos]
-    norm_new_view = norms_sel[sel_pos : sel_pos + 1]
+    norm_new = norms_sel[sel_pos : sel_pos + 1]
 
     if sel_pos == 0:
         ext.fps_update_cuda(
@@ -210,7 +200,7 @@ def _voronoi_step_multi_sharded(
             x_new,
             hausdorff_shard,
             voronoi_shard,
-            norm_new_view,
+            norm_new,
             sel_pos,
         )
     else:
@@ -222,48 +212,40 @@ def _voronoi_step_multi_sharded(
             dSL_quarter[:sel_pos],
             hausdorff_shard,
             voronoi_shard,
-            norm_new_view,
+            norm_new,
             sel_pos,
         )
 
 
 # ---------------------------------------------------------------------------
-# Sharded bisect simulation wrapper
+# Bisect simulation wrapper + bisection
 # ---------------------------------------------------------------------------
 
 
 def _simulate_fps_voronoi_multi_sharded(
     X_local: Tensor,
     norms_local: Tensor,
-    h_m_shard: Tensor,
-    voronoi_m_shard: Tensor,
+    h_mid: Tensor,
+    voronoi_mid: Tensor,
     X_sel: Tensor,
     norms_sel: Tensor,
     sep: float,
     points_left: int,
     n_init: int,
-    shard_offset: int,
-    N_shard: int,
-    rank: int,
-    world_size: int,
+    layout: ShardLayout,
     scratch: Dict,
 ) -> Tuple[bool, int]:
     """Thin wrapper around the C++/NCCL sharded sim loop."""
     ext = get_ext()
-    pg = scratch["pg"]
-
-    X_sel_init = X_sel[:n_init]
-    norms_sel_init = norms_sel[:n_init]
-
     is_viable, steps_used = ext.simulate_fps_voronoi_multi_sharded(
         X_local,
         norms_local,
-        h_m_shard,
-        voronoi_m_shard,
+        h_mid,
+        voronoi_mid,
         X_sel,
         norms_sel,
-        X_sel_init,
-        norms_sel_init,
+        X_sel[:n_init],
+        norms_sel[:n_init],
         scratch["block_vals"],
         scratch["block_idxs"],
         scratch["d_out_val"],
@@ -276,17 +258,12 @@ def _simulate_fps_voronoi_multi_sharded(
         scratch["sim_active_mask"],
         float(sep),
         int(points_left),
-        int(shard_offset),
-        int(N_shard),
-        int(world_size),
-        pg,
+        int(layout.shard_offset),
+        int(layout.N_shard),
+        int(layout.world_size),
+        scratch["pg"],
     )
     return bool(is_viable), int(steps_used)
-
-
-# ---------------------------------------------------------------------------
-# Sharded bisection
-# ---------------------------------------------------------------------------
 
 
 def _bisect_voronoi_multi_sharded(
@@ -303,24 +280,17 @@ def _bisect_voronoi_multi_sharded(
     step_seps: List[float],
     total_budget: int,
     n_snap: int,
-    shard_offset: int,
-    N_shard: int,
-    rank: int,
-    world_size: int,
-    sizes: List[int],
-    offsets: List[int],
-    D: int,
+    layout: ShardLayout,
+    dim: int,
     scratch: Dict,
 ) -> int:
-    """Binary-search for the maximum viable prefix of ``added`` (sharded X)."""
+    """Binary-search the maximum viable prefix length of ``added``."""
     ext = get_ext()
-    dev = X_local.device
-    N_global = sum(sizes)
-    stride = 3 + D
+    device = X_local.device
+    stride = 3 + dim
 
     sim_X_sel = scratch["sim_X_sel"]
     sim_norms_sel = scratch["sim_norms_sel"]
-
     low, high, best = 0, len(added), 0
 
     while low <= high:
@@ -329,15 +299,13 @@ def _bisect_voronoi_multi_sharded(
         points_left = total_budget - mid
         final_size = len(sel_start) + mid + points_left
 
-        if final_size >= N_global:
-            best = mid
-            low = mid + 1
+        if final_size >= layout.N_global:
+            best, low = mid, mid + 1
             continue
 
-        # NB: _reconstruct_hausdorff_with_voronoi_multi only reads X_shard /
-        # norms_shard (indexed by local row ids), never X_full — so passing
-        # X_local / norms_local is correct for the sharded path.
-        h_m, v_m = _reconstruct_hausdorff_with_voronoi_multi(
+        # NB: reconstruct only reads X/norms by *local* row id, so passing
+        # X_local/norms_local here is correct — the helper never needs X_full.
+        h_mid, voronoi_mid = reconstruct_hausdorff_with_voronoi_multi(
             h_snap,
             h_final,
             v_final,
@@ -350,32 +318,29 @@ def _bisect_voronoi_multi_sharded(
             mid,
             n_snap,
             sel_start,
-            shard_offset,
-            N_shard,
+            layout.shard_offset,
+            layout.N_shard,
         )
 
-        # Global n_positive early-exit.
-        n_pos_local = int((h_m >= 0).sum().item())
-        np_t = torch.tensor([n_pos_local], dtype=torch.long, device=dev)
-        dist.all_reduce(np_t, op=dist.ReduceOp.SUM)
-        n_pos_global = int(np_t.item())
+        n_pos_local = int((h_mid >= 0).sum().item())
+        n_pos_t = torch.tensor([n_pos_local], dtype=torch.long, device=device)
+        dist.all_reduce(n_pos_t, op=dist.ReduceOp.SUM)
+        n_pos_global = int(n_pos_t.item())
 
         if points_left >= n_pos_global:
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
             continue
 
         if points_left == 0:
-            # Compute global max of h_m via the val slot only.  Other slots
-            # are untouched (any stale bits are ignored — we only read [0]).
-            if N_shard > 0:
+            # Global max(h_mid) via the val slot only; other slots ignored.
+            if layout.N_shard > 0:
                 ext.argmax_cuda(
-                    h_m,
+                    h_mid,
                     scratch["block_vals"],
                     scratch["block_idxs"],
                     scratch["d_out_val"],
                     scratch["d_out_idx"],
-                    N_shard,
+                    layout.N_shard,
                 )
                 scratch["argmax_local_pack"][0] = scratch["d_out_val"][0]
             else:
@@ -386,38 +351,32 @@ def _bisect_voronoi_multi_sharded(
             )
             max_h_global = float(scratch["argmax_gather_buf"][0::stride].max().item())
             if sep_mid > max_h_global:
-                best = mid
-                low = mid + 1
+                best, low = mid, mid + 1
             else:
                 high = mid - 1
             continue
 
-        # Copy the sel_prefix portion into the sim scratch.
         n_init = n_snap + mid
         if n_init > 0:
             sim_X_sel[:n_init].copy_(X_sel[:n_init])
             sim_norms_sel[:n_init].copy_(norms_sel[:n_init])
 
-        is_viable, _steps = _simulate_fps_voronoi_multi_sharded(
+        is_viable, _ = _simulate_fps_voronoi_multi_sharded(
             X_local,
             norms_local,
-            h_m,
-            v_m,
+            h_mid,
+            voronoi_mid,
             sim_X_sel,
             sim_norms_sel,
             float(sep_mid),
             int(points_left),
             n_init,
-            shard_offset,
-            N_shard,
-            rank,
-            world_size,
+            layout,
             scratch,
         )
 
         if is_viable:
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
         else:
             high = mid - 1
 
@@ -425,7 +384,7 @@ def _bisect_voronoi_multi_sharded(
 
 
 # ---------------------------------------------------------------------------
-# Sharded main entrypoint
+# Underlying entrypoint
 # ---------------------------------------------------------------------------
 
 
@@ -447,179 +406,87 @@ def accrete_voronoi_multi_sharded(
     """Multi-GPU CUDA accrete with X sharded across ranks.
 
     Each rank holds only ``X_local`` — its slice of the global feature
-    matrix — not the full ``X``.  Use ``compute_shard_layout`` to compute
-    slice boundaries; the caller is responsible for loading each rank's
-    shard so that concatenation by rank order reproduces the global
-    ``cat([X_A, X_C])``.
+    matrix. Use :func:`compute_shard_layout` to compute slice boundaries; the
+    caller is responsible for loading each rank's shard so concatenation by
+    rank order reproduces the global ``cat([X_A, X_C])``.
 
     Checkpointing
     -------------
-    If ``checkpoint_path`` is given, rank 0 writes the coreset-so-far to
-    ``{checkpoint_path}_k{k:02d}.npy`` after every completed layer and
-    updates ``{checkpoint_path}_latest.txt`` with the last completed
-    ``k``.  Writes are atomic (tmp file + rename).  There is no built-in
-    resume — the caller inspects ``{checkpoint_path}_latest.txt``, loads
-    the corresponding ``.npy``, and passes it as ``idx_A`` (with
-    ``N_A_global = len(idx_A)``) in a fresh call to continue from the
-    last checkpoint.  This gives crash-survival without coupling the
-    library to a specific resume schema.
+    If ``checkpoint_path`` is given, rank 0 atomically writes the
+    coreset-so-far to ``{checkpoint_path}_k{k:02d}.npy`` after each layer
+    and updates ``{checkpoint_path}_latest.txt``. There is no built-in
+    resume — the caller inspects the latest file, loads the corresponding
+    ``.npy``, and passes it as ``idx_A`` (with ``N_A_global=len(idx_A)``)
+    in a fresh call.
 
-    ``X_sel`` (the selected centers) remains replicated on every rank — it
-    is small enough (K × D) that replication is cheaper than cross-rank
-    gathers during bisect reconstruction.
+    ``X_sel`` (the selected centers) is replicated on every rank — small
+    enough (K × D) that replication beats cross-rank gathers in bisect.
 
-    Returns global coreset indices (same tensor on every rank).
+    Returns global coreset indices (same on every rank).
     """
     if not dist.is_initialized():
         raise RuntimeError(
             "torch.distributed is not initialised. "
-            "Call dist.init_process_group(backend='nccl') before "
-            "accrete_voronoi_multi_sharded."
+            "Call dist.init_process_group(backend='nccl') first."
         )
-
-    _trace_f = open(trace_path, "w") if (trace_path and rank == 0) else None
-
-    def _trace(phase: str, sel_pos: int, idx: int, val: float, sep: float) -> None:
-        if _trace_f is not None:
-            _trace_f.write(f"{phase}\t{sel_pos}\t{idx}\t{float(val).hex()}\t{float(sep).hex()}\n")
 
     ensure_compiled()
     ext = get_ext()
 
-    # ---- Input validation --------------------------------------------------
-    # N_global cap: the int32 bitcast used to pack (val, global_idx) into a
-    # float32 pair slot only covers the int32 range.  Production target is
-    # ≤ 1 B; the ceiling is 2^31 - 1.
-    if N_global >= 2**31:
-        raise ValueError(
-            f"N_global={N_global} exceeds int32 index range (max 2^31 - 1). "
-            "The packed (val, global_idx) slot uses int32 bitcast; larger N "
-            "would silently truncate indices."
-        )
-    if len(shard_sizes) != world_size:
-        raise ValueError(f"shard_sizes has {len(shard_sizes)} entries but world_size={world_size}")
-    if sum(shard_sizes) != N_global:
-        raise ValueError(f"shard_sizes sums to {sum(shard_sizes)}, expected N_global={N_global}")
-    if any(s < 0 for s in shard_sizes):
-        raise ValueError(f"shard_sizes contains negative entries: {shard_sizes}")
-    if X_local.shape[0] != shard_sizes[rank]:
-        raise ValueError(
-            f"rank {rank}: X_local has {X_local.shape[0]} rows, "
-            f"expected shard_sizes[{rank}]={shard_sizes[rank]}"
-        )
-    if X_local.dim() != 2:
-        raise ValueError(f"X_local must be 2-D [N_local, D], got shape {tuple(X_local.shape)}")
-    if idx_A.numel() == 0:
-        raise ValueError("idx_A is empty — need at least one anchor point.")
-    if not (0 <= N_A_global <= N_global):
-        raise ValueError(f"N_A_global={N_A_global} must be in [0, N_global={N_global}]")
-    # Layout contract: X_local must be row-major contiguous.  The pack kernel
-    # reads X_local + local_idx * D directly; a strided shard would corrupt
-    # writes into X_sel / norms_local silently.
-    X_local = X_local.contiguous()
+    trace = Tracer(trace_path if rank == 0 else None)
+
+    _validate_inputs(rank, world_size, N_A_global, N_global, shard_sizes, X_local, idx_A)
+    X_local = X_local.contiguous()  # pack kernel reads X_local + idx*D directly
 
     sizes = list(shard_sizes)
     offsets = [sum(sizes[:i]) for i in range(world_size)]
-    N_shard = sizes[rank]
-    shard_offset = offsets[rank]
+    layout = ShardLayout(rank=rank, world_size=world_size, sizes=sizes, offsets=offsets)
+    device = X_local.device
+    dim = X_local.shape[1]
 
-    if not X_local.is_cuda:
-        raise ValueError(f"X_local must be on a CUDA device, got {X_local.device}")
-
-    D = X_local.shape[1]
-    dev = X_local.device
-
-    # Cross-rank consistency on D — the AllGather buffer size depends on
-    # it, so a silent mismatch would corrupt every step.
-    _d_max = torch.tensor([D], dtype=torch.long, device=dev)
-    _d_min = _d_max.clone()
-    dist.all_reduce(_d_max, op=dist.ReduceOp.MAX)
-    dist.all_reduce(_d_min, op=dist.ReduceOp.MIN)
-    if int(_d_max.item()) != D or int(_d_min.item()) != D:
-        raise ValueError(
-            f"rank {rank}: D={D} disagrees with peers "
-            f"(cluster min={int(_d_min.item())}, max={int(_d_max.item())}). "
-            "Every rank must hold the same feature dimension."
-        )
-
-    # idx_A range check — anchors must be valid global indices.
-    idx_min = int(idx_A.min().item())
-    idx_max = int(idx_A.max().item())
-    if idx_min < 0 or idx_max >= N_global:
-        raise ValueError(
-            f"idx_A values out of range: min={idx_min}, max={idx_max}, " f"expected [0, {N_global})"
-        )
+    _check_dim_consistency(dim, device)
+    _check_anchor_range(idx_A, N_global)
 
     norms_local = (X_local * X_local).sum(dim=1).to(torch.float32)
 
-    # ---- Determine safe max_k from GPU memory budget (all ranks agree) ----
-    _elem = X_local.element_size()
-    if max_k is None:
-        free_bytes, _ = torch.cuda.mem_get_info(dev)
-        bytes_per_sel_row = 2 * D * _elem + 5 * 4
-        budget = int(free_bytes * 0.30)
-        max_k_mem = max(1, int(math.log2(max(1, budget // bytes_per_sel_row))))
-        max_k = min(int(math.log2(N_global)), max_k_mem)
-
-        mk_t = torch.tensor([max_k], dtype=torch.long, device=dev)
-        dist.all_reduce(mk_t, op=dist.ReduceOp.MIN)
-        max_k = int(mk_t.item())
-
-    max_sel = 2**max_k
-    stride = 3 + D
+    max_k, max_sel = _resolve_max_k(max_k, N_global, dim, X_local.element_size(), device)
+    stride = 3 + dim
 
     hausdorff_shard = torch.full(
-        (N_shard,),
+        (layout.N_shard,),
         float("inf"),
         dtype=torch.float32,
-        device=dev,
+        device=device,
     )
-    voronoi_shard = torch.zeros(N_shard, dtype=torch.long, device=dev)
-    X_sel = torch.empty((max_sel, D), dtype=X_local.dtype, device=dev)
-    norms_sel = torch.empty(max_sel, dtype=torch.float32, device=dev)
+    voronoi_shard = torch.zeros(layout.N_shard, dtype=torch.long, device=device)
+    X_sel = torch.empty((max_sel, dim), dtype=X_local.dtype, device=device)
+    norms_sel = torch.empty(max_sel, dtype=torch.float32, device=device)
 
-    _n_blocks = ext.MAX_ARGMAX_BLOCKS
-    scratch: Dict = {
-        "block_vals": torch.empty(_n_blocks, dtype=torch.float32, device=dev),
-        "block_idxs": torch.empty(_n_blocks, dtype=torch.int32, device=dev),
-        "d_out_val": torch.empty(1, dtype=torch.float32, device=dev),
-        "d_out_idx": torch.empty(1, dtype=torch.int32, device=dev),
-        "dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=dev),
-        "sim_X_sel": torch.empty((max_sel, D), dtype=X_local.dtype, device=dev),
-        "sim_norms_sel": torch.empty(max_sel, dtype=torch.float32, device=dev),
-        "sim_dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=dev),
-        "sim_active_mask": torch.empty(max_sel, dtype=torch.int32, device=dev),
-        "d_local_sep": torch.empty(1, dtype=torch.float32, device=dev),
-        "d_viable": torch.empty(1, dtype=torch.int32, device=dev),
-        "argmax_local_pack": torch.empty(stride, dtype=torch.float32, device=dev),
-        "argmax_gather_buf": torch.empty(world_size * stride, dtype=torch.float32, device=dev),
-        "pg": dist.distributed_c10d._get_default_group(),
-    }
+    scratch = _alloc_scratch(
+        max_sel, dim, X_local.dtype, device, ext.MAX_ARGMAX_BLOCKS, world_size, stride
+    )
 
-    target: List[int] = idx_A.tolist()
+    anchor_indices: List[int] = idx_A.tolist()
     nested_blocks: List[Set[int]] = [
-        set(target[: min(2**i, N_A_global)]) for i in range(1, max_k + 1)
+        set(anchor_indices[: min(2**i, N_A_global)]) for i in range(1, max_k + 1)
     ]
 
-    first = target[0]
-    current_sel: List[int] = [first]
+    first = anchor_indices[0]
+    selected: List[int] = [first]
     selected_set: Set[int] = {first}
-    current_sep = float("inf")
+    sep = float("inf")
 
-    owner = _owner_of(first, sizes, offsets)
-    # Populate gather_buf with the initial seed row (owner has the data).
+    # Seed: pack the owner's row, then commit at sel_pos=0.
+    owner = layout.owner_of(first)
     _pack_row_by_owner(
         X_local,
         norms_local,
         first,
         owner,
-        shard_offset,
-        N_shard,
+        layout,
         scratch["argmax_local_pack"],
         scratch["argmax_gather_buf"],
-        world_size,
-        D,
-        rank,
+        dim,
     )
     _voronoi_step_multi_sharded(
         X_local,
@@ -633,128 +500,81 @@ def accrete_voronoi_multi_sharded(
         first,
         0,
         owner,
-        shard_offset,
-        N_shard,
+        layout,
         owner,
-        rank,
-        D,
+        dim,
     )
 
-    prof = {
-        "snapshot_s": 0.0,
-        "select_block_s": 0.0,
-        "bisect_s": 0.0,
-        "replay_s": 0.0,
-        "fill_s": 0.0,
-        "voronoi_step_s": 0.0,
-    }
-
-    def _sync() -> None:
-        if X_local.is_cuda:
-            torch.cuda.synchronize()
+    profiler = PhaseTimer(enabled=profile, on_cuda=X_local.is_cuda)
 
     if verbose and rank == 0:
-        print(
-            f"accrete_voronoi_multi_sharded: N={N_global}, D={D}, "
-            f"max_k={max_k}, world_size={world_size}"
-        )
-        print(f"  shard sizes = {sizes}")
-        print(
-            f"{'k':<4} | {'size':<6} | {'in_Bk':>6} | {'from_A':>7} | {'from_C':>7} | "
-            f"{'sep':>9} | {'cov':>9} | {'rel_gap':>11}"
-        )
-        print("-" * 79)
+        _print_header(N_global, dim, max_k, world_size, sizes)
 
     for k in range(1, max_k + 1):
         target_size = 2**k
-        points_needed = target_size - len(current_sel)
-        if points_needed <= 0:
+        budget = target_size - len(selected)
+        if budget <= 0:
             continue
-        target_blocks = nested_blocks[k - 1 :]
 
-        for block_pool in target_blocks:
-            if points_needed <= 0:
+        for block in nested_blocks[k - 1 :]:
+            if budget <= 0:
                 break
-            desired = sorted(block_pool - selected_set)
+            desired = sorted(block - selected_set)
             if not desired:
                 continue
 
-            # ---- Snapshot ----
-            if profile:
-                _sync()
-                t_prof = time.perf_counter()
-            h_snap = hausdorff_shard.clone()
-            v_snap = voronoi_shard.clone()
-            sep_snap = current_sep
-            n_snap = len(current_sel)
-            sel_snap = list(current_sel)
-            if profile:
-                _sync()
-                prof["snapshot_s"] += time.perf_counter() - t_prof
+            with profiler("snapshot_s"):
+                h_snap = hausdorff_shard.clone()
+                v_snap = voronoi_shard.clone()
+                sep_snap = sep
+                n_snap = len(selected)
+                sel_snap = list(selected)
 
-            # ---- Forward FPS on desired pool ----
             added: List[int] = []
             step_seps: List[float] = [sep_snap]
-            max_add = min(points_needed, len(desired))
-            pool_global = torch.tensor(desired, dtype=torch.long, device=dev)
+            max_add = min(budget, len(desired))
+            pool_global = torch.tensor(desired, dtype=torch.long, device=device)
 
-            if profile:
-                _sync()
-                t_prof = time.perf_counter()
-            for _step in range(max_add):
-                best_val, best_global, winner_rank = _restricted_argmax_global_sharded(
-                    pool_global,
-                    hausdorff_shard,
-                    X_local,
-                    norms_local,
-                    shard_offset,
-                    N_shard,
-                    scratch["argmax_local_pack"],
-                    scratch["argmax_gather_buf"],
-                    world_size,
-                    D,
-                )
-                if best_val <= 0.0 or best_global < 0:
-                    break
-                current_sep = min(current_sep, best_val)
-                step_seps.append(current_sep)
-                added.append(best_global)
-                sel_pos = len(current_sel)
-                current_sel.append(best_global)
-                selected_set.add(best_global)
-                _trace("forward", sel_pos, best_global, best_val, current_sep)
+            with profiler("select_block_s"):
+                for _ in range(max_add):
+                    best_val, new_idx, winner_rank = _restricted_argmax_global_sharded(
+                        pool_global,
+                        hausdorff_shard,
+                        X_local,
+                        norms_local,
+                        layout,
+                        scratch["argmax_local_pack"],
+                        scratch["argmax_gather_buf"],
+                        dim,
+                    )
+                    if best_val <= 0.0 or new_idx < 0:
+                        break
+                    sep = min(sep, best_val)
+                    step_seps.append(sep)
+                    added.append(new_idx)
+                    sel_pos = len(selected)
+                    selected.append(new_idx)
+                    selected_set.add(new_idx)
+                    trace("forward", sel_pos, new_idx, best_val, sep)
 
-                owner = _owner_of(best_global, sizes, offsets)
-                if profile:
-                    _sync()
-                    t_step = time.perf_counter()
-                _voronoi_step_multi_sharded(
-                    X_local,
-                    norms_local,
-                    hausdorff_shard,
-                    voronoi_shard,
-                    X_sel,
-                    norms_sel,
-                    scratch["argmax_gather_buf"],
-                    scratch["dSL_quarter"],
-                    best_global,
-                    sel_pos,
-                    winner_rank,
-                    shard_offset,
-                    N_shard,
-                    owner,
-                    rank,
-                    D,
-                )
-                if profile:
-                    _sync()
-                    prof["voronoi_step_s"] += time.perf_counter() - t_step
-
-                pool_global = pool_global[pool_global != best_global]
-
-            if profile:
-                _sync()
-                prof["select_block_s"] += time.perf_counter() - t_prof
+                    with profiler("voronoi_step_s"):
+                        _voronoi_step_multi_sharded(
+                            X_local,
+                            norms_local,
+                            hausdorff_shard,
+                            voronoi_shard,
+                            X_sel,
+                            norms_sel,
+                            scratch["argmax_gather_buf"],
+                            scratch["dSL_quarter"],
+                            new_idx,
+                            sel_pos,
+                            winner_rank,
+                            layout,
+                            layout.owner_of(new_idx),
+                            dim,
+                        )
+                    pool_global = pool_global[pool_global != new_idx]
 
             if not added:
                 continue
@@ -762,233 +582,143 @@ def accrete_voronoi_multi_sharded(
             h_final = hausdorff_shard.clone()
             v_final = voronoi_shard.clone()
 
-            # ---- Bisect ----
-            if profile:
-                _sync()
-                t_prof = time.perf_counter()
-            best_m = _bisect_voronoi_multi_sharded(
-                X_local,
-                norms_local,
-                h_snap,
-                h_final,
-                v_final,
-                v_snap,
-                X_sel,
-                norms_sel,
-                sel_snap,
-                added,
-                step_seps,
-                points_needed,
-                n_snap,
-                shard_offset,
-                N_shard,
-                rank,
-                world_size,
-                sizes,
-                offsets,
-                D,
-                scratch,
-            )
-            if profile:
-                _sync()
-                prof["bisect_s"] += time.perf_counter() - t_prof
-
-            # ---- Rollback ----
-            hausdorff_shard.copy_(h_snap)
-            voronoi_shard.copy_(v_snap)
-            current_sel = list(sel_snap)
-            selected_set = set(sel_snap)
-            current_sep = sep_snap
-
-            # ---- Replay best_m steps ----
-            if profile:
-                _sync()
-                t_prof = time.perf_counter()
-            for j in range(best_m):
-                idx = added[j]
-                sel_pos = len(current_sel)
-                current_sel.append(idx)
-                selected_set.add(idx)
-                current_sep = step_seps[j + 1]
-                _trace("replay", sel_pos, idx, current_sep, current_sep)
-                owner = _owner_of(idx, sizes, offsets)
-                _pack_row_by_owner(
+            with profiler("bisect_s"):
+                best_m = _bisect_voronoi_multi_sharded(
                     X_local,
                     norms_local,
-                    idx,
-                    owner,
-                    shard_offset,
-                    N_shard,
-                    scratch["argmax_local_pack"],
-                    scratch["argmax_gather_buf"],
-                    world_size,
-                    D,
-                    rank,
-                )
-                if profile:
-                    _sync()
-                    t_step = time.perf_counter()
-                _voronoi_step_multi_sharded(
-                    X_local,
-                    norms_local,
-                    hausdorff_shard,
-                    voronoi_shard,
+                    h_snap,
+                    h_final,
+                    v_final,
+                    v_snap,
                     X_sel,
                     norms_sel,
-                    scratch["argmax_gather_buf"],
-                    scratch["dSL_quarter"],
-                    idx,
-                    sel_pos,
-                    owner,
-                    shard_offset,
-                    N_shard,
-                    owner,
-                    rank,
-                    D,
+                    sel_snap,
+                    added,
+                    step_seps,
+                    budget,
+                    n_snap,
+                    layout,
+                    dim,
+                    scratch,
                 )
-                if profile:
-                    _sync()
-                    prof["voronoi_step_s"] += time.perf_counter() - t_step
-            if profile:
-                _sync()
-                prof["replay_s"] += time.perf_counter() - t_prof
 
-            points_needed -= best_m
+            # Rollback then replay best_m steps.
+            hausdorff_shard.copy_(h_snap)
+            voronoi_shard.copy_(v_snap)
+            selected = list(sel_snap)
+            selected_set = set(sel_snap)
+            sep = sep_snap
 
-        # ---- Fill remaining with unconstrained FPS ----
-        if profile:
-            _sync()
-            t_prof = time.perf_counter()
-        while points_needed > 0:
-            best_val, best_global, winner_rank = _argmax_global_sharded(
-                hausdorff_shard,
-                X_local,
-                norms_local,
-                shard_offset,
-                N_shard,
-                scratch["block_vals"],
-                scratch["block_idxs"],
-                scratch["d_out_val"],
-                scratch["d_out_idx"],
-                scratch["argmax_local_pack"],
-                scratch["argmax_gather_buf"],
-                world_size,
-                D,
-            )
-            if best_global < 0:
-                break
-            current_sep = min(current_sep, best_val)
-            sel_pos = len(current_sel)
-            current_sel.append(best_global)
-            selected_set.add(best_global)
-            _trace("fill", sel_pos, best_global, best_val, current_sep)
-            owner = _owner_of(best_global, sizes, offsets)
-            if profile:
-                _sync()
-                t_step = time.perf_counter()
-            _voronoi_step_multi_sharded(
-                X_local,
-                norms_local,
-                hausdorff_shard,
-                voronoi_shard,
-                X_sel,
-                norms_sel,
-                scratch["argmax_gather_buf"],
-                scratch["dSL_quarter"],
-                best_global,
-                sel_pos,
-                winner_rank,
-                shard_offset,
-                N_shard,
-                owner,
-                rank,
-                D,
-            )
-            if profile:
-                _sync()
-                prof["voronoi_step_s"] += time.perf_counter() - t_step
-            points_needed -= 1
-        if profile:
-            _sync()
-            prof["fill_s"] += time.perf_counter() - t_prof
+            with profiler("replay_s"):
+                for j in range(best_m):
+                    new_idx = added[j]
+                    sel_pos = len(selected)
+                    selected.append(new_idx)
+                    selected_set.add(new_idx)
+                    sep = step_seps[j + 1]
+                    trace("replay", sel_pos, new_idx, sep, sep)
+                    owner = layout.owner_of(new_idx)
+                    _pack_row_by_owner(
+                        X_local,
+                        norms_local,
+                        new_idx,
+                        owner,
+                        layout,
+                        scratch["argmax_local_pack"],
+                        scratch["argmax_gather_buf"],
+                        dim,
+                    )
+                    with profiler("voronoi_step_s"):
+                        _voronoi_step_multi_sharded(
+                            X_local,
+                            norms_local,
+                            hausdorff_shard,
+                            voronoi_shard,
+                            X_sel,
+                            norms_sel,
+                            scratch["argmax_gather_buf"],
+                            scratch["dSL_quarter"],
+                            new_idx,
+                            sel_pos,
+                            owner,
+                            layout,
+                            owner,
+                            dim,
+                        )
 
-        # End-of-level invariant check + numeric rel_gap diagnostic.
-        # hausdorff is sharded across ranks here -> need allreduce-MAX for
-        # global cov.  Hard abort on gross violation (rel_gap < -1e-3).
-        GROSS_VIOLATION_REL = 1e-3
+            budget -= best_m
 
-        local_cov_sq = float(hausdorff_shard.max().item())
-        if local_cov_sq < 0.0:
-            local_cov_sq = 0.0
-        _cov_t = torch.tensor([local_cov_sq], device=dev, dtype=torch.float32)
-        dist.all_reduce(_cov_t, op=dist.ReduceOp.MAX)
-        cov_sq = float(_cov_t.item())
-        sep_sq = current_sep
-        sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
-        cov_val = math.sqrt(cov_sq)
-        rel_gap = (
-            (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
+        with profiler("fill_s"):
+            while budget > 0:
+                best_val, new_idx, winner_rank = _argmax_global_sharded(
+                    hausdorff_shard,
+                    X_local,
+                    norms_local,
+                    layout,
+                    scratch["block_vals"],
+                    scratch["block_idxs"],
+                    scratch["d_out_val"],
+                    scratch["d_out_idx"],
+                    scratch["argmax_local_pack"],
+                    scratch["argmax_gather_buf"],
+                    dim,
+                )
+                if new_idx < 0:
+                    break
+                sep = min(sep, best_val)
+                sel_pos = len(selected)
+                selected.append(new_idx)
+                selected_set.add(new_idx)
+                trace("fill", sel_pos, new_idx, best_val, sep)
+                with profiler("voronoi_step_s"):
+                    _voronoi_step_multi_sharded(
+                        X_local,
+                        norms_local,
+                        hausdorff_shard,
+                        voronoi_shard,
+                        X_sel,
+                        norms_sel,
+                        scratch["argmax_gather_buf"],
+                        scratch["dSL_quarter"],
+                        new_idx,
+                        sel_pos,
+                        winner_rank,
+                        layout,
+                        layout.owner_of(new_idx),
+                        dim,
+                    )
+                budget -= 1
+
+        cov_sq, sep_val, cov_val, rel_gap = _check_invariant_global(
+            hausdorff_shard,
+            sep,
+            k,
+            target_size,
+            device,
         )
-
-        if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_VIOLATION_REL):
-            raise RuntimeError(
-                f"accrete_voronoi_multi_sharded: sep > cov violated at level k={k} "
-                f"(size={target_size}): sep={sep_val:.8e}, cov={cov_val:.8e}, "
-                f"sep^2={sep_sq:.8e}, cov^2={cov_sq:.8e}, rel_gap={rel_gap:.3e}. "
-                f"Gross violation, not float noise."
-            )
-
         if verbose and rank == 0:
-            sel_set = set(current_sel[:target_size])
-            in_bk = len(sel_set & nested_blocks[k - 1])
-            from_a = sum(1 for s in sel_set if s < N_A_global)
-            rel_gap_str = f"{rel_gap:>11.3e}" if math.isfinite(rel_gap) else f"{'inf':>11}"
-            print(
-                f"{k:<4} | {target_size:<6} | {in_bk:>6} | "
-                f"{from_a:>7} | {target_size - from_a:>7} | "
-                f"{sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str}"
+            _print_level_row(
+                k,
+                target_size,
+                selected,
+                nested_blocks[k - 1],
+                N_A_global,
+                sep_val,
+                cov_val,
+                rel_gap,
             )
 
-        # Per-layer checkpoint
         if checkpoint_path is not None and rank == 0:
-            ckpt_file = f"{checkpoint_path}_k{k:02d}.npy"
-            tmp_file = ckpt_file + ".tmp"
-            coreset_np = np.asarray(current_sel[:target_size], dtype=np.int64)
-            with open(tmp_file, "wb") as f:
-                np.save(f, coreset_np, allow_pickle=False)
-            os.replace(tmp_file, ckpt_file)
-
-            latest_file = f"{checkpoint_path}_latest.txt"
-            latest_tmp = latest_file + ".tmp"
-            with open(latest_tmp, "w") as f:
-                f.write(f"{k}\n")
-            os.replace(latest_tmp, latest_file)
-            if verbose:
-                print(f"  [checkpoint] k={k} → {ckpt_file} " f"({len(coreset_np):,} points)")
+            _write_checkpoint(checkpoint_path, k, selected, target_size, verbose)
 
     if profile and rank == 0:
-        total = sum(prof.values())
-        print("\n[Profile: accrete_voronoi_multi_sharded phases]")
-        for key in (
-            "snapshot_s",
-            "select_block_s",
-            "bisect_s",
-            "replay_s",
-            "fill_s",
-            "voronoi_step_s",
-        ):
-            val = prof[key]
-            pct = (100.0 * val / total) if total > 0 else 0.0
-            print(f"  {key:<14} {val:8.3f}s  ({pct:5.1f}%)")
-
-    if _trace_f is not None:
-        _trace_f.close()
-
-    return torch.tensor(current_sel, dtype=torch.long, device=dev)
+        profiler.report("accrete_voronoi_multi_sharded phases")
+    trace.close()
+    return torch.tensor(selected, dtype=torch.long, device=device)
 
 
 # ---------------------------------------------------------------------------
-# Public API — recommended entry point for production sharded runs.
+# Public API — the recommended entry point.
 # ---------------------------------------------------------------------------
 
 
@@ -1005,68 +735,54 @@ def accrete_sharded(
 ) -> Tensor:
     """Sharded multi-GPU FPS-accretion coreset.
 
-    Recommended entry point for production runs. Infers ``rank``,
+    Recommended entry point for production. Auto-discovers ``rank``,
     ``world_size``, and the shard layout from the active
-    ``torch.distributed`` process group, so the caller only supplies the
-    per-rank data and the anchor metadata.
+    ``torch.distributed`` group; the caller only supplies per-rank data
+    and anchor metadata.
 
-    Setup contract (caller's responsibility):
+    Setup contract:
 
     1. ``dist.init_process_group(backend='nccl', ...)`` is initialised.
-    2. Each rank places its row-major contiguous slice of the global
-       feature matrix ``cat([X_A, X_C])`` on its local CUDA device, as
-       ``X_local`` (float32, shape ``(N_shard, D)``). Concatenating every
-       rank's ``X_local`` in rank order must reproduce the full matrix.
+    2. Each rank places its row-major contiguous slice of ``cat([X_A, X_C])``
+       on its local CUDA device as ``X_local`` (float32, shape ``(N_shard, D)``).
+       Concatenating every rank's ``X_local`` in rank order must reproduce the
+       full matrix.
     3. The first ``n_anchor`` rows of the global matrix are the *anchor*
-       subset (preserved in the hierarchy at levels k where
-       ``2^k <= n_anchor``); the remaining rows are *candidates*.
+       subset; the rest are *candidates*.
 
     Parameters
     ----------
-    X_local : Tensor (N_shard, D), float32, on this rank's CUDA device
-        This rank's slice of the global feature matrix.
-    anchor_order : Tensor (>=1,), int64
-        Global FPS hierarchy of the anchor (indices into the global
-        matrix). Must satisfy ``0 <= anchor_order < N_global``.
+    X_local : (N_shard, D) float32, on this rank's CUDA device
+    anchor_order : (>=1,) int64
+        Global FPS hierarchy of the anchor (indices into the global matrix).
     n_anchor : int
-        Number of anchor rows. Anchor block at level k is the first
-        ``min(2^k, n_anchor)`` entries of ``anchor_order``.
+        Number of anchor rows.
     max_k : int, optional
-        Final coreset size = ``2 ** max_k``. If ``None``, auto-derived
-        from GPU memory. **Pin explicitly in production**: chained
-        continuation runs grow ``X_A`` across stages, and the auto value
-        can shrink silently.
+        Final coreset size = ``2 ** max_k``. Auto-derived from GPU memory if
+        ``None`` — **pin in production**: chained continuation runs grow the
+        anchor between stages, and the auto value can shrink silently.
     checkpoint_path : str, optional
-        If given, rank 0 writes ``{checkpoint_path}_k{k:02d}.npy`` after
-        every completed level (atomic). Resume by passing the latest
-        snapshot as ``anchor_order`` in a fresh call.
+        Rank 0 writes ``{checkpoint_path}_k{k:02d}.npy`` after every layer.
     trace_path : str, optional
-        Diagnostic trace file (rank 0 only); used by determinism tests.
-    verbose : bool
-        Per-level progress output on rank 0.
-    profile : bool
-        Phase-level timing breakdown at end of run.
+        Diagnostic trace file (rank 0 only).
 
     Returns
     -------
-    Tensor (``2 ** max_k``,), int64
-        Global coreset indices in the union ``cat([X_A, X_C])`` index
-        space. Same tensor on every rank.
+    (2 ** max_k,) int64
+        Global coreset indices. Same tensor on every rank.
 
-    Example
-    -------
-    See ``examples/run_minimal.py`` for a complete runnable script.
+    See ``examples/run_minimal.py`` for a runnable script.
 
     Notes
     -----
-    Thin wrapper around :func:`accrete_voronoi_multi_sharded`; output is
+    Thin wrapper over :func:`accrete_voronoi_multi_sharded`; output is
     byte-identical to a direct call with the same effective layout.
     """
     if not dist.is_initialized():
         raise RuntimeError(
             "torch.distributed must be initialised before accrete_sharded(). "
-            "Call dist.init_process_group(backend='nccl', ...) first. For "
-            "single-GPU runs, use accrete from coreset_cuda."
+            "Call dist.init_process_group(backend='nccl', ...) first. "
+            "For single-GPU runs, use coresets.accrete instead."
         )
     if not X_local.is_cuda:
         raise ValueError(
@@ -1077,9 +793,8 @@ def accrete_sharded(
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # Discover shard layout from each rank's X_local row count. Every rank
-    # writes its size at index `rank` of a zero-init tensor; AllReduce-SUM
-    # then yields the full layout on every rank with no Python coordination.
+    # Discover shard layout: each rank writes its row count at index `rank` of
+    # a zero-init tensor; AllReduce-SUM yields the full layout everywhere.
     sizes_t = torch.zeros(world_size, dtype=torch.long, device=X_local.device)
     sizes_t[rank] = X_local.shape[0]
     dist.all_reduce(sizes_t, op=dist.ReduceOp.SUM)
@@ -1100,3 +815,157 @@ def accrete_sharded(
         trace_path=trace_path,
         checkpoint_path=checkpoint_path,
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_inputs(rank, world_size, N_A_global, N_global, shard_sizes, X_local, idx_A):
+    """Cheap input-shape / range checks; abort with a useful message on failure."""
+    # The pack uses an int32 bitcast for the index slot — N_global must fit.
+    if N_global >= 2**31:
+        raise ValueError(
+            f"N_global={N_global} exceeds int32 range (2^31 - 1). "
+            "The packed (val, global_idx) slot uses int32 bitcast; larger N "
+            "would silently truncate indices."
+        )
+    if len(shard_sizes) != world_size:
+        raise ValueError(f"shard_sizes has {len(shard_sizes)} entries; world_size={world_size}")
+    if sum(shard_sizes) != N_global:
+        raise ValueError(f"shard_sizes sums to {sum(shard_sizes)}, expected {N_global}")
+    if any(s < 0 for s in shard_sizes):
+        raise ValueError(f"shard_sizes has negatives: {shard_sizes}")
+    if X_local.shape[0] != shard_sizes[rank]:
+        raise ValueError(
+            f"rank {rank}: X_local has {X_local.shape[0]} rows, "
+            f"expected shard_sizes[{rank}]={shard_sizes[rank]}"
+        )
+    if X_local.dim() != 2:
+        raise ValueError(f"X_local must be 2-D, got shape {tuple(X_local.shape)}")
+    if idx_A.numel() == 0:
+        raise ValueError("idx_A is empty — need at least one anchor point.")
+    if not 0 <= N_A_global <= N_global:
+        raise ValueError(f"N_A_global={N_A_global} must be in [0, N_global={N_global}]")
+    if not X_local.is_cuda:
+        raise ValueError(f"X_local must be on a CUDA device, got {X_local.device}")
+
+
+def _check_dim_consistency(dim, device):
+    """Cross-rank D match — silent mismatch would corrupt every AllGather."""
+    d_max = torch.tensor([dim], dtype=torch.long, device=device)
+    d_min = d_max.clone()
+    dist.all_reduce(d_max, op=dist.ReduceOp.MAX)
+    dist.all_reduce(d_min, op=dist.ReduceOp.MIN)
+    if int(d_max.item()) != dim or int(d_min.item()) != dim:
+        raise ValueError(
+            f"D={dim} disagrees with peers (cluster min={int(d_min.item())}, "
+            f"max={int(d_max.item())}). Every rank must hold the same feature dim."
+        )
+
+
+def _check_anchor_range(idx_A, N_global):
+    idx_min = int(idx_A.min().item())
+    idx_max = int(idx_A.max().item())
+    if idx_min < 0 or idx_max >= N_global:
+        raise ValueError(
+            f"idx_A out of range: min={idx_min}, max={idx_max}; expected [0, {N_global})"
+        )
+
+
+def _resolve_max_k(max_k, n_global, dim, elem_bytes, device):
+    """Pick ``max_k`` against a 30%-of-free-mem budget; reduce across ranks."""
+    if max_k is None:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        bytes_per_sel_row = 2 * dim * elem_bytes + 5 * 4
+        budget = int(free_bytes * 0.30)
+        max_k_mem = max(1, int(math.log2(max(1, budget // bytes_per_sel_row))))
+        max_k = min(int(math.log2(n_global)), max_k_mem)
+
+        mk_t = torch.tensor([max_k], dtype=torch.long, device=device)
+        dist.all_reduce(mk_t, op=dist.ReduceOp.MIN)
+        max_k = int(mk_t.item())
+    return max_k, 2**max_k
+
+
+def _alloc_scratch(max_sel, dim, x_dtype, device, n_argmax_blocks, world_size, stride):
+    return {
+        "block_vals": torch.empty(n_argmax_blocks, dtype=torch.float32, device=device),
+        "block_idxs": torch.empty(n_argmax_blocks, dtype=torch.int32, device=device),
+        "d_out_val": torch.empty(1, dtype=torch.float32, device=device),
+        "d_out_idx": torch.empty(1, dtype=torch.int32, device=device),
+        "dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=device),
+        "sim_X_sel": torch.empty((max_sel, dim), dtype=x_dtype, device=device),
+        "sim_norms_sel": torch.empty(max_sel, dtype=torch.float32, device=device),
+        "sim_dSL_quarter": torch.empty(max_sel, dtype=torch.float32, device=device),
+        "sim_active_mask": torch.empty(max_sel, dtype=torch.int32, device=device),
+        "d_local_sep": torch.empty(1, dtype=torch.float32, device=device),
+        "d_viable": torch.empty(1, dtype=torch.int32, device=device),
+        "argmax_local_pack": torch.empty(stride, dtype=torch.float32, device=device),
+        "argmax_gather_buf": torch.empty(world_size * stride, dtype=torch.float32, device=device),
+        "pg": dist.distributed_c10d._get_default_group(),
+    }
+
+
+def _check_invariant_global(hausdorff_shard, sep_sq, k, target_size, device):
+    """Verify Gonzalez ``sep > cov`` over the global cov via AllReduce-MAX."""
+    GROSS_REL = 1e-3
+    local_cov_sq = max(0.0, float(hausdorff_shard.max().item()))
+    cov_t = torch.tensor([local_cov_sq], device=device, dtype=torch.float32)
+    dist.all_reduce(cov_t, op=dist.ReduceOp.MAX)
+    cov_sq = float(cov_t.item())
+    sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
+    cov_val = math.sqrt(cov_sq)
+    rel_gap = (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
+
+    if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_REL):
+        raise RuntimeError(
+            f"accrete_voronoi_multi_sharded: sep > cov violated at k={k} "
+            f"(size={target_size}): sep={sep_val:.8e}, cov={cov_val:.8e}, "
+            f"rel_gap={rel_gap:.3e}. Gross violation, not float noise."
+        )
+    return cov_sq, sep_val, cov_val, rel_gap
+
+
+def _print_header(N_global, dim, max_k, world_size, sizes):
+    print(
+        f"accrete_voronoi_multi_sharded: N={N_global}, D={dim}, "
+        f"max_k={max_k}, world_size={world_size}"
+    )
+    print(f"  shard sizes = {sizes}")
+    print(
+        f"{'k':<4} | {'size':<6} | {'in_Bk':>6} | {'from_A':>7} | {'from_C':>7} | "
+        f"{'sep':>9} | {'cov':>9} | {'rel_gap':>11}"
+    )
+    print("-" * 79)
+
+
+def _print_level_row(k, target_size, selected, block_k, N_A_global, sep_val, cov_val, rel_gap):
+    sel_set = set(selected[:target_size])
+    in_bk = len(sel_set & block_k)
+    from_a = sum(1 for s in sel_set if s < N_A_global)
+    rel_gap_str = f"{rel_gap:>11.3e}" if math.isfinite(rel_gap) else f"{'inf':>11}"
+    print(
+        f"{k:<4} | {target_size:<6} | {in_bk:>6} | "
+        f"{from_a:>7} | {target_size - from_a:>7} | "
+        f"{sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str}"
+    )
+
+
+def _write_checkpoint(checkpoint_path, k, selected, target_size, verbose):
+    """Atomic per-layer dump (rank 0). Updates ``_latest.txt`` last."""
+    ckpt_file = f"{checkpoint_path}_k{k:02d}.npy"
+    tmp_file = ckpt_file + ".tmp"
+    coreset_np = np.asarray(selected[:target_size], dtype=np.int64)
+    with open(tmp_file, "wb") as f:
+        np.save(f, coreset_np, allow_pickle=False)
+    os.replace(tmp_file, ckpt_file)
+
+    latest_file = f"{checkpoint_path}_latest.txt"
+    latest_tmp = latest_file + ".tmp"
+    with open(latest_tmp, "w") as f:
+        f.write(f"{k}\n")
+    os.replace(latest_tmp, latest_file)
+    if verbose:
+        print(f"  [checkpoint] k={k} → {ckpt_file} ({len(coreset_np):,} points)")

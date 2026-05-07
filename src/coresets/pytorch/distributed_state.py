@@ -1,21 +1,15 @@
-"""Distributed FPS state for multi-GPU coreset construction.
+"""Distributed FPS state for the pure-torch multi-GPU reference.
 
-Shards the descriptor matrix X across GPUs while keeping the Hausdorff
-distance vector replicated on every rank.  The expensive O(N*D) distance
-computation is distributed; control-flow operations (argmax, kthvalue,
-masking) operate on the local replica without extra communication.
+Shards X across GPUs but keeps Hausdorff replicated on every rank. The
+O(N·D) distance pass is distributed; argmax/kthvalue/masking run on the
+local replica without extra comm.
 
-Communication per update step
------------------------------
-  broadcast : D floats   (center descriptor)
-  allgather : N floats   (distance vector)
-
-For N = 1M, D = 512 on 4 H100s with NVLink this is ~4 MB / step,
-roughly 7 us latency — negligible compared to the matmul.
+Per update step: broadcast D floats (center) + allgather N floats (distances).
+At N=1M, D=512, 4 H100s on NVLink that's ~4 MB / 7 µs — negligible vs the matmul.
 """
 
 import bisect
-from typing import List, Tuple
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -23,18 +17,7 @@ from torch import Tensor
 
 
 class DistributedFPSState:
-    """Multi-GPU FPS state with sharded X and replicated hausdorff.
-
-    Parameters
-    ----------
-    X_local : Tensor (n_local, D)
-        This rank's contiguous shard of the full descriptor matrix.
-        Rank r holds global rows [offset_r, offset_r + n_local_r).
-    rank : int
-        Process rank.
-    world_size : int
-        Total number of processes.
-    """
+    """Sharded X, replicated hausdorff. Rank r owns rows [offset_r, +n_local_r)."""
 
     def __init__(self, X_local: Tensor, rank: int, world_size: int):
         self.rank = rank
@@ -44,7 +27,7 @@ class DistributedFPSState:
         self.n_local = X_local.shape[0]
         self.D = X_local.shape[1]
 
-        # --- exchange shard sizes so every rank knows the global layout ---
+        # Discover global layout via AllGather of each rank's row count.
         n_local_t = torch.tensor([self.n_local], dtype=torch.int64, device=self.device)
         sizes_list = [
             torch.zeros(1, dtype=torch.int64, device=self.device) for _ in range(world_size)
@@ -54,14 +37,14 @@ class DistributedFPSState:
         self.N: int = sum(self.all_sizes)
         self.offsets: List[int] = [sum(self.all_sizes[:i]) for i in range(world_size)]
         self.my_offset: int = self.offsets[rank]
-        # cumulative boundaries for bisect-based owner lookup
+        # Cumulative boundaries for bisect-based owner lookup.
         self._cum: List[int] = [0] + [sum(self.all_sizes[: i + 1]) for i in range(world_size)]
 
-        # --- sharded data (O(N*D) total, split across ranks) ---
+        # Sharded data (O(N·D) total, split across ranks).
         self.X_local = X_local
         self.norms_local = (X_local * X_local).sum(dim=1)
 
-        # --- scratch / communication buffers ---
+        # Scratch + comm buffers.
         self.d_local = torch.empty(self.n_local, dtype=self.dtype, device=self.device)
         self._center = torch.empty(self.D, dtype=self.dtype, device=self.device)
         self._d_bufs: List[Tensor] = [
@@ -69,22 +52,11 @@ class DistributedFPSState:
         ]
         self._d_full = torch.empty(self.N, dtype=self.dtype, device=self.device)
 
-    # ------------------------------------------------------------------
-
     def _owner_of(self, global_idx: int) -> int:
-        """Return the rank that owns *global_idx*."""
         return bisect.bisect_right(self._cum, global_idx) - 1
 
-    # ------------------------------------------------------------------
-    # Building blocks
-    # ------------------------------------------------------------------
-
     def broadcast_descriptor(self, global_idx: int) -> Tensor:
-        """Broadcast descriptor of *global_idx* from owner to all ranks.
-
-        Returns the shared ``_center`` buffer (D,).  The caller must
-        consume or copy it before the next call.
-        """
+        """Broadcast row ``global_idx`` from its owner. Returns shared ``_center`` buffer."""
         owner = self._owner_of(global_idx)
         if self.rank == owner:
             local_idx = global_idx - self.offsets[owner]
@@ -93,13 +65,7 @@ class DistributedFPSState:
         return self._center
 
     def compute_distances(self, center: Tensor) -> Tensor:
-        """Compute squared distances from *center* to every point.
-
-        Each rank does its local matmul, then ``allgather`` reconstructs
-        the full distance vector on every rank.
-
-        Returns the shared ``_d_full`` buffer (N,).
-        """
+        """Squared distances from ``center`` to every point. Returns shared ``_d_full``."""
         norm_new = (center * center).sum()
         self.d_local.copy_(self.norms_local).add_(norm_new)
         torch.addmv(
@@ -123,11 +89,9 @@ class DistributedFPSState:
         center: Tensor,
         active_mask: Tensor,
     ) -> Tensor:
-        """Like :meth:`compute_distances` but only computes rows where
-        *active_mask* is True.  Inactive positions are set to ``inf``.
+        """Like :meth:`compute_distances` but only over active rows; rest = inf.
 
-        Saves compute when the active fraction is small; communication
-        cost (allgather N floats) is the same.
+        Saves compute when the active fraction is small; comm cost is unchanged.
         """
         norm_new = (center * center).sum()
         local_active = active_mask[self.my_offset : self.my_offset + self.n_local]
@@ -146,10 +110,6 @@ class DistributedFPSState:
             off += n
         return self._d_full
 
-    # ------------------------------------------------------------------
-    # Composite operations
-    # ------------------------------------------------------------------
-
     def update_on(
         self,
         h: Tensor,
@@ -157,7 +117,7 @@ class DistributedFPSState:
         global_idx: int,
         sel_idx: int,
     ) -> None:
-        """Distributed fps_update on an arbitrary replicated ``(h, v)`` pair."""
+        """Distributed ``fps_update`` on a replicated ``(h, v)`` pair."""
         center = self.broadcast_descriptor(global_idx)
         d = self.compute_distances(center)
         closer = d < h

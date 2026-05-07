@@ -1,29 +1,13 @@
-// kernels/argmax.cu — split out from the original kernels.cu.
+// kernels/argmax.cu — two-phase argmax with deterministic tie-break.
 #include "_shared.cuh"
 
-// ===========================================================================
-// 3. Argmax kernels (two-phase reduction: (value, index) pair)
-//
-// Determinism note: naive parallel argmax is non-deterministic when the max
-// value is tied between several rows — whichever block/warp partial gets
-// selected by `>` comparison wins, and that ordering depends on the launch
-// geometry (number of blocks, shard boundaries).  Down the road that
-// cascades: the FPS algorithm is chaotic, so a tie broken one way here
-// makes a subtly different selection 10 steps later, and the bisect
-// eventually lands on a different coreset size.  That's why the single-
-// and multi-GPU CUDA runs diverged before this fix.
-//
-// Resolution: on ties we prefer the smaller *global* index.  Cost is one
-// extra integer compare inside an already warp-serialized reduction —
-// unmeasurable.  Gain: CUDA-1-GPU ≡ CUDA-N-GPU bit-for-bit, because the
-// per-row distances computed by warp_dot are already deterministic (each
-// row is reduced within a single warp in fixed lane order).
-//
-// NB: we do *not* match Python's `torch.argmax` bitwise — Python uses
-// cuBLAS GEMV for the distance, which has a different FP reduction order
-// than warp_dot, so the distances themselves differ in the last bit.
-// That's a numerical difference the tie-break can't paper over.
-// ===========================================================================
+// Determinism: naive parallel argmax is non-deterministic on ties — launch
+// geometry decides the winner. FPS is chaotic, so a flipped tie cascades
+// into a different coreset 10 steps later. Tie-break = smaller global idx
+// (one extra int compare, no measurable cost). Gives single ≡ multi
+// byte-identity. Does NOT match torch.argmax bitwise — cuBLAS GEMV has a
+// different FP reduction order, so the distances themselves disagree in
+// the last bit, which a tie-break can't paper over.
 
 // Tie-break: strictly greater value wins; on equal values, smaller index wins.
 template <typename idx_t>
@@ -42,9 +26,7 @@ __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __re
     int global_start = blockIdx.x * blockDim.x + tid;
     int stride = gridDim.x * blockDim.x;
 
-    // Each thread scans its stride slice and keeps the best (value, idx).
-    // Initial sentinel uses idx = INT_MAX so any real index wins on ties
-    // (and we never take the sentinel accidentally).
+    // Sentinel idx = INT_MAX so any real index wins on ties.
     float local_val = -1e38f;
     int local_idx = INT_MAX;
 
@@ -60,7 +42,7 @@ __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __re
     si[tid] = local_idx;
     __syncthreads();
 
-    // Standard shared-memory tree reduction, extended with tie-break.
+    // Tree reduction with tie-break.
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             float v_other = sv[tid + s];
@@ -79,8 +61,8 @@ __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __re
     }
 }
 
-// Phase 2: warp-level reduction over ≤1024 partial results.
-// Launch with <<<1, 32>>> so each of the 32 threads covers n_blocks/32 entries.
+// Phase 2: warp shuffle reduction over the ≤1024 phase-1 partials.
+// Launch <<<1, 32>>> — each lane covers n_blocks/32 entries.
 __global__ void argmax_phase2_kernel(const float* __restrict__ block_vals,
                                      const int* __restrict__ block_idxs,
                                      float* __restrict__ d_out_val, int* __restrict__ d_out_idx,
@@ -98,8 +80,7 @@ __global__ void argmax_phase2_kernel(const float* __restrict__ block_vals,
         }
     }
 
-// Warp reduction via shuffle: lane i reads lane i+offset; after log2(32)
-// rounds lane 0 holds the global winner.  Tie-break extends the compare.
+// Lane i reads lane i+offset; after log2(32) rounds lane 0 holds the winner.
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         float other_val = __shfl_down_sync(0xffffffff, best_val, offset);
@@ -112,12 +93,11 @@ __global__ void argmax_phase2_kernel(const float* __restrict__ block_vals,
 
     if (tid == 0) {
         d_out_val[0] = best_val;
-        // Clamp sentinel back to -1 for empty inputs, matching prior contract.
-        d_out_idx[0] = (best_idx == INT_MAX) ? -1 : best_idx;
+        d_out_idx[0] = (best_idx == INT_MAX) ? -1 : best_idx;  // sentinel → -1
     }
 }
 
-// 4. Max-value-only kernels (for viability early-exit check, no index needed)
+// Max-value-only kernels (used by the viability early-exit; no index needed).
 
 template <typename scalar_t>
 __global__ void max_phase1_kernel(const scalar_t* __restrict__ h, float* __restrict__ block_vals,
@@ -145,7 +125,7 @@ __global__ void max_phase1_kernel(const scalar_t* __restrict__ h, float* __restr
         block_vals[blockIdx.x] = smem_max[0];
 }
 
-// Phase 2: warp-level reduction (launch <<<1, 32>>>)
+// Phase 2: warp reduction. Launch <<<1, 32>>>.
 __global__ void max_phase2_kernel(const float* __restrict__ block_vals,
                                   float* __restrict__ d_out_val, const int n_blocks) {
     int tid = threadIdx.x;
@@ -165,23 +145,9 @@ __global__ void max_phase2_kernel(const float* __restrict__ block_vals,
         d_out_val[0] = best_val;
 }
 
-// ===========================================================================
-// 6d. Final viability check kernels (C1 fix)
-//
-// The per-step check inside simulate_fps_voronoi[_multi] mirrors the Python
-// reference's in-loop `if local_sep > max_val: return True`, but the
-// reference also has a post-loop `return local_sep > max(h)` that reads h
-// *after* the final update.  Without that post-loop check the sim can
-// report non-viable when the reference would report viable (bisect too
-// conservative — still produces a valid coreset, but diverges from ref).
-//
-// Single-GPU: reads d_local_sep (running min sep) and d_out_val (= max h
-// after the last voronoi_update, from a fresh argmax) and sets d_viable=1
-// when sep > best_val.
-//
-// Multi-GPU: reduces the post-loop allgather buffer on device and applies
-// the same sep > best_val test.  Stays on-device — no extra D2H.
-// ===========================================================================
+// C1: post-loop viability check. The in-loop test compares sep against the
+// max(h) *before* the final update — without this the bisect reports
+// non-viable where the reference reports viable. Stays on device (no D2H).
 
 __global__ void final_viable_check_kernel(
     const float* __restrict__ d_out_val,    // [1] max(h_m) after final update
@@ -240,5 +206,3 @@ void max_val_cuda(torch::Tensor h, torch::Tensor block_vals, int64_t N, torch::T
     max_phase2_kernel<<<1, 32>>>(block_vals.data_ptr<float>(), d_out_val.data_ptr<float>(),
                                  n_blocks);
 }
-
-// C++ wrapper for commit_center_kernel

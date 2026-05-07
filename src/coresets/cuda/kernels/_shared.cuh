@@ -1,9 +1,9 @@
 #pragma once
 
-// Common header for the split CUDA extension: includes, constants, and
-// forward declarations of every C++ wrapper so files can call across the
-// translation-unit boundary. Templates and __device__ helpers stay in their
-// own .cu files (they're instantiated only via AT_DISPATCH at the call site).
+// Common header for the split CUDA extension. Holds includes, constants,
+// and forward declarations of every C++ wrapper — lets the .cu files call
+// each other across translation-unit boundaries. Templates and __device__
+// helpers stay in their own .cu (instantiated via AT_DISPATCH at the call site).
 
 #include <torch/extension.h>
 #include <pybind11/stl.h>

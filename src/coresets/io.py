@@ -1,31 +1,21 @@
 """Standard results format for chained coreset runs.
 
-Layout
-------
-::
+Layout::
 
     results/<run_name>/
-    ├── manifest.json              # run-level: target_K, dataset registry, schema
-    ├── LATEST                     # text: name of most recently completed step
-    └── NNN_<step_name>/
-        ├── coreset.npy            # int64 (K,) — the answer
-        ├── provenance.npy         # structured: source_id uint16, source_row int64
-        ├── per_level.tsv          # streamed per level: k, size, sep, cov, rel_gap, walltime_s
-        └── step.json              # parents, max_k, walltime, peak_mem, max_rel_gap, success
+    ├── manifest.json   # target_K, data sources, schema
+    ├── LATEST          # name of most recent successful step
+    └── NNN_<name>/
+        ├── coreset.npy        # int64 (K,) — the answer
+        ├── provenance.npy     # (source_id uint16, source_row int64)
+        ├── per_level.tsv      # streamed: k, size, sep, cov, rel_gap, walltime_s
+        └── step.json          # parents, max_k, walltime, peak_mem, max_rel_gap, success
 
-The numbered prefix (``NNN``) is auto-assigned by ``save_step`` based on
-existing directories — first step is ``000``, second is ``001``, etc. Names
-themselves are user-chosen and human-readable. ``parents`` in ``step.json``
-encodes lineage for non-linear runs (re-do, branch).
+``NNN`` is auto-assigned by :func:`save_step` (000, 001, …); ``name`` is
+user-chosen. ``parents`` in ``step.json`` encodes lineage for re-runs/branches.
 
-Public API
-----------
-- :func:`init_run`           : create a new run directory and manifest
-- :func:`register_source`    : add a data source to the manifest
-- :func:`save_step`          : atomic write of a step's outputs
-- :func:`load_step`          : read a step back (coreset, provenance, metadata)
-- :func:`load_latest`        : load the most recent step in a run
-- :func:`append_per_level`   : streaming append of one level's metrics during a run
+API: :func:`init_run`, :func:`register_source`, :func:`save_step`,
+:func:`load_step`, :func:`load_latest`, :func:`append_per_level`.
 """
 
 from __future__ import annotations
@@ -43,8 +33,8 @@ import numpy as np
 
 SCHEMA_VERSION = 1
 
-# Structured dtype for the (source_id, source_row) provenance array. Parallel
-# to coreset.npy: provenance[i] is (source_id, source_row) for coreset[i].
+# Provenance array runs parallel to coreset.npy: provenance[i] resolves the
+# i-th selected point back to (source_id, source_row).
 PROVENANCE_DTYPE = np.dtype([("source_id", np.uint16), ("source_row", np.int64)])
 
 PathLike = Union[str, os.PathLike]
@@ -97,30 +87,14 @@ def init_run(
 ) -> Path:
     """Create ``results_root/<run_name>/`` with a fresh ``manifest.json``.
 
-    Subsequent ``save_step`` calls append to this run. Use ``register_source``
-    to record dataset metadata (path, sha256, n_rows) before the first step.
-
-    Parameters
-    ----------
-    results_root : path-like
-        Directory under which all runs live.
-    run_name : str
-        Subdirectory for this run. Must not already exist unless ``overwrite``.
-    target_K : int
-        Final coreset size goal (e.g. 10_000_000). Recorded for downstream tools.
-    feature_dim : int
-        Feature dimension D used throughout the run.
-    description : str
-        Optional free-text description.
-    overwrite : bool
-        If ``True``, deletes any existing run dir of the same name first.
+    Subsequent :func:`save_step` calls append to this run. Use
+    :func:`register_source` to record dataset metadata before the first step.
     """
     root = Path(results_root) / run_name
     if root.exists():
         if not overwrite:
             raise FileExistsError(f"run already exists: {root}. Pass overwrite=True to wipe.")
-        # Recursive delete is dangerous; require explicit overwrite.
-        import shutil
+        import shutil  # rmtree is destructive; only reachable via explicit overwrite
 
         shutil.rmtree(root)
     root.mkdir(parents=True)
@@ -149,11 +123,10 @@ def register_source(
     sha256: Optional[str] = None,
     extra: Optional[dict] = None,
 ) -> int:
-    """Add a data source to the run's manifest. Returns the assigned source_id.
+    """Add a data source to the run's manifest; returns the assigned source_id.
 
-    The source_id is small int that gets stored in ``provenance.npy`` so the
-    coreset can be resolved back to (dataset, row) tuples without keeping the
-    full source name on every row.
+    The id is the small uint16 stored in ``provenance.npy`` — keeps per-row
+    bookkeeping cheap while still resolving back to ``(dataset, row)``.
     """
     root = Path(results_root) / run_name
     manifest_path = root / "manifest.json"
@@ -226,21 +199,12 @@ def save_step(
 ) -> Path:
     """Atomically write one step's outputs and update LATEST.
 
-    The step directory is created at ``results/<run_name>/NNN_<step_name>/``,
-    where ``NNN`` is auto-assigned (or supplied via ``step_idx`` for overwrites).
+    Step dir is ``results/<run_name>/NNN_<step_name>/`` — ``NNN`` is
+    auto-assigned (or supplied via ``step_idx`` to overwrite).
 
-    Parameters
-    ----------
-    coreset : ndarray (K,) int64
-        The selected indices in this step's local index space.
-    provenance : ndarray (K,) with dtype PROVENANCE_DTYPE, optional
-        Per-pick (source_id, source_row) tuples resolved to the *original*
-        datasets (not to local indices of the prior step). Strongly recommended
-        — without this you can't compute "leftover from prev step" later.
-    stats : StepStats
-        Summary stats; serialised to ``step.json``.
-    started_at : ISO timestamp string, optional
-        When the step's compute started. Defaults to (finished_at - walltime_s).
+    ``provenance`` (parallel to ``coreset``) resolves each pick back to its
+    *original* dataset+row. Strongly recommended — without it, "leftover
+    from prev step" isn't computable later.
     """
     if coreset.ndim != 1 or coreset.dtype != np.int64:
         raise ValueError(
@@ -265,7 +229,6 @@ def save_step(
     step_dir = _step_dir(run_dir, step_idx, step_name)
     step_dir.mkdir(parents=True, exist_ok=True)
 
-    # Atomic per-file writes (each via tmp + os.replace)
     _save_npy_atomic(step_dir / "coreset.npy", coreset)
     if provenance is not None:
         _save_npy_atomic(step_dir / "provenance.npy", provenance)
@@ -289,17 +252,16 @@ def save_step(
     }
     _atomic_write_json(step_dir / "step.json", step_meta)
 
-    # Update LATEST only on success — preserves the last-good pointer if a
-    # half-completed step gets saved with success=False.
+    # Only successful steps move LATEST — keeps the last-good pointer intact
+    # when a half-finished step is saved with success=False.
     if stats.success:
         _atomic_write_text(run_dir / "LATEST", step_dir.name + "\n")
     return step_dir
 
 
 def _save_npy_atomic(path: Path, arr: np.ndarray) -> None:
-    # np.save auto-appends ``.npy`` when given a string/Path without that suffix,
-    # so passing an open file handle is the only way to write to an arbitrary
-    # tmp name and rename atomically.
+    # Write via an open file handle so np.save doesn't auto-append ``.npy``
+    # to our tmp suffix and break the atomic rename.
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "wb") as f:
         np.save(f, arr, allow_pickle=False)
@@ -311,8 +273,8 @@ def load_step(
     run_name: str,
     step_name_or_dir: str,
 ) -> dict:
-    """Read a step back. ``step_name_or_dir`` accepts either the bare name
-    (``"after_b1"``) or the prefixed dir name (``"002_after_b1"``).
+    """Read a step. Accepts either the bare name (``after_b1``) or the
+    prefixed dir name (``002_after_b1``).
     """
     run_dir = Path(results_root) / run_name
     step_dir = _resolve_step_dir(run_dir, step_name_or_dir)
@@ -361,7 +323,7 @@ def _resolve_step_dir(run_dir: Path, name: str) -> Path:
     if not matches:
         raise FileNotFoundError(f"no step matching {name!r} in {run_dir}")
     matches.sort()
-    return matches[-1]  # latest if multiple (re-runs)
+    return matches[-1]  # latest wins on re-run with the same step name
 
 
 # --------------------------------------------------------------------------- #
@@ -373,15 +335,13 @@ _PER_LEVEL_HEADER = "k\tsize\tsep\tcov\trel_gap\twalltime_s\n"
 
 
 def open_per_level(step_dir: PathLike) -> "_PerLevelWriter":
-    """Open the streaming per-level TSV writer for an in-progress step.
+    """Streaming per-level TSV writer for an in-progress step.
 
-    Use *during* a step (before ``save_step``) to log each level's metrics as
-    they are computed. The writer flushes after every line so the file is
-    safely tail-able from another process during multi-day runs.
+    Flushes after every line — safely tail-able from another process during
+    multi-day runs.
 
-    Typical usage::
+    Usage::
 
-        step_dir = Path(results_root) / run_name / f"{idx:03d}_{name}"
         step_dir.mkdir(parents=True, exist_ok=True)
         with open_per_level(step_dir) as plog:
             for k, size, sep, cov, rel_gap, dt in level_iter():
@@ -393,7 +353,7 @@ def open_per_level(step_dir: PathLike) -> "_PerLevelWriter":
 class _PerLevelWriter:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._fh = open(path, "w", buffering=1)  # line-buffered
+        self._fh = open(path, "w", buffering=1)  # line-buffered for tailing
         self._fh.write(_PER_LEVEL_HEADER)
 
     def write(
@@ -431,8 +391,8 @@ def append_per_level(
     rel_gap: float,
     walltime_s: float,
 ) -> None:
-    """Convenience: append one row to a step's per_level.tsv (creates with
-    header on first call). Use ``open_per_level`` for hot-loop writes."""
+    """Append one row to a step's per_level.tsv (creates with header on first
+    call). Prefer :func:`open_per_level` for hot-loop writes."""
     run_dir = Path(results_root) / run_name
     step_dir = _resolve_step_dir(run_dir, step_name_or_dir)
     path = step_dir / "per_level.tsv"
