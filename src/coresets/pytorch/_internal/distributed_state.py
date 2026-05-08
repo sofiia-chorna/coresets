@@ -1,11 +1,11 @@
 """Distributed FPS state for the pure-torch multi-GPU reference.
 
 Shards X across GPUs but keeps Hausdorff replicated on every rank. The
-O(N·D) distance pass is distributed; argmax/kthvalue/masking run on the
+O(N*D) distance pass is distributed; argmax/kthvalue/masking run on the
 local replica without extra comm.
 
 Per update step: broadcast D floats (center) + allgather N floats (distances).
-At N=1M, D=512, 4 H100s on NVLink that's ~4 MB / 7 µs — negligible vs the matmul.
+At N=1M, D=512, 4 H100s on NVLink that's ~4 MB / 7 us - negligible vs the matmul.
 """
 
 import bisect
@@ -25,7 +25,7 @@ class DistributedFPSState:
         n_local, D: this rank's row count + feature dimension.
         all_sizes: ``(world_size,)`` row counts, gathered from every rank.
         N: total rows (``= sum(all_sizes)``).
-        offsets: ``(world_size,)`` — rank ``r``'s rows start at ``offsets[r]``.
+        offsets: ``(world_size,)`` - rank ``r``'s rows start at ``offsets[r]``.
         my_offset: ``offsets[rank]``.
         X_local: this rank's row slice.
         norms_local: ``(X_local * X_local).sum(dim=1)``.
@@ -35,7 +35,7 @@ class DistributedFPSState:
         """Discover the global layout via AllGather and allocate scratch buffers.
 
         Args:
-            X_local: ``(n_local, D)`` — this rank's row slice of the global matrix.
+            X_local: ``(n_local, D)`` - this rank's row slice of the global matrix.
             rank: this rank's id in ``[0, world_size)``.
             world_size: number of ranks in the distributed group.
         """
@@ -46,7 +46,7 @@ class DistributedFPSState:
         self.n_local = X_local.shape[0]
         self.D = X_local.shape[1]
 
-        # discover global layout: each rank reports its row count, AllGather collects them
+        # discover global layout: each rank reports its row count, AllGather collects them.
         n_local_t = torch.tensor([self.n_local], dtype=torch.int64, device=self.device)
         sizes_list = [
             torch.zeros(1, dtype=torch.int64, device=self.device) for _ in range(world_size)
@@ -57,14 +57,14 @@ class DistributedFPSState:
         self.offsets: List[int] = [sum(self.all_sizes[:i]) for i in range(world_size)]
         self.my_offset: int = self.offsets[rank]
 
-        # cumulative boundaries: _cum[i] = offset of rank i. used for bisect-based owner lookup
+        # cumulative boundaries: _cum[i] = offset of rank i. used for bisect-based owner lookup.
         self._cum: List[int] = [0] + [sum(self.all_sizes[: i + 1]) for i in range(world_size)]
 
-        # sharded data - total memory is O(N x D) but split across ranks
+        # sharded data - total memory is O(N*D) but split across ranks.
         self.X_local = X_local
         self.norms_local = (X_local * X_local).sum(dim=1)
 
-        # scratch + comm buffers reused across calls (no per-step allocation)
+        # scratch + comm buffers reused across calls (no per-step allocation).
         self.d_local = torch.empty(self.n_local, dtype=self.dtype, device=self.device)
         self._center = torch.empty(self.D, dtype=self.dtype, device=self.device)
         self._d_bufs: List[Tensor] = [
@@ -73,7 +73,7 @@ class DistributedFPSState:
         self._d_full = torch.empty(self.N, dtype=self.dtype, device=self.device)
 
     def _owner_of(self, global_idx: int) -> int:
-        # bisect over cumulative boundaries - O(log world_size)
+        # bisect over cumulative boundaries - O(log world_size).
         return bisect.bisect_right(self._cum, global_idx) - 1
 
     def broadcast_descriptor(self, global_idx: int) -> Tensor:
@@ -82,17 +82,17 @@ class DistributedFPSState:
         Args:
             global_idx: index into the global matrix.
 
-        Returns the shared ``_center`` buffer (re-used across calls — copy if you
+        Returns the shared ``_center`` buffer (re-used across calls - copy if you
         need to retain the row past the next call).
         """
         owner = self._owner_of(global_idx)
 
-        # owner copies the row into the shared buffer. everyone else waits
+        # owner copies the row into the shared buffer; everyone else waits.
         if self.rank == owner:
             local_idx = global_idx - self.offsets[owner]
             self._center.copy_(self.X_local[local_idx])
 
-        # NCCL broadcast - owner's bytes overwrite every rank's _center
+        # NCCL broadcast - owner's bytes overwrite every rank's _center.
         dist.broadcast(self._center, src=owner)
         return self._center
 
@@ -105,12 +105,12 @@ class DistributedFPSState:
 
         Returns the shared ``_d_full`` buffer of length ``N`` - re-used across calls.
         """
-        # local distances first: d = ||X_local - center||^2 = norms_local + ||center||² - 2 X_local x center
+        # local distances first: d = ||X_local - center||^2 = norms_local + ||center||^2 - 2 X_local*center.
         norm_new = (center * center).sum()
         self.d_local.copy_(self.norms_local).add_(norm_new)
         torch.addmv(self.d_local, self.X_local, center, beta=1, alpha=-2, out=self.d_local)
 
-        # AllGather every rank's slice into a flat (N,) buffer (concat in rank order)
+        # AllGather every rank's slice into a flat (N,) buffer (concat in rank order).
         dist.all_gather(self._d_bufs, self.d_local)
         off = 0
         for buf in self._d_bufs:
@@ -126,23 +126,23 @@ class DistributedFPSState:
 
         Args:
             center: ``(D,)`` query row.
-            active_mask: ``(N,)`` bool — only ``True`` rows get a real distance.
+            active_mask: ``(N,)`` bool - only ``True`` rows get a real distance.
 
         Returns the shared ``_d_full`` buffer of length ``N``.
         """
         norm_new = (center * center).sum()
 
-        # restrict to this rank's slice of the mask
+        # restrict to this rank's slice of the mask.
         local_active = active_mask[self.my_offset : self.my_offset + self.n_local]
         self.d_local.fill_(float("inf"))
 
-        # only compute distances for active rows in this shard
+        # only compute distances for active rows in this shard.
         if local_active.any():
             idx = torch.where(local_active)[0]
             d_act = self.norms_local[idx] + norm_new - 2.0 * (self.X_local[idx] @ center)
             self.d_local[idx] = d_act
 
-        # same gather pattern as compute_distances - comm volume is unchanged
+        # same gather pattern as compute_distances - comm volume is unchanged.
         dist.all_gather(self._d_bufs, self.d_local)
         off = 0
         for buf in self._d_bufs:
@@ -160,14 +160,14 @@ class DistributedFPSState:
             global_idx: row to commit as the new center.
             sel_idx: this center's position in the selected list (written into ``v``).
         """
-        # broadcast the new center, compute distances against all rows
+        # broadcast the new center, compute distances against all rows.
         center = self.broadcast_descriptor(global_idx)
         d = self.compute_distances(center)
 
-        # rows that just got closer => reassign cell
+        # rows that just got closer -> reassign cell.
         closer = d < h
         v.masked_fill_(closer, sel_idx)
 
-        # h = min(h, d); mark the new center with -1 so it can't be picked again
+        # h = min(h, d); mark the new center with -1 so it can't be picked again.
         torch.minimum(h, d, out=h)
         h[global_idx] = -1.0

@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from ..ext import ensure_compiled, get_ext
+from ..extension import ensure_compiled, get_ext
 from ._base import MultiGPUAccrete
 from ._shared import resolve_max_k
 from .layout import ShardLayout, compute_shard_layout

@@ -1,13 +1,4 @@
-"""Hausdorff-state reconstruction at bisect-mid prefixes.
-
-Two helpers, both used to rebuild ``(h, voronoi)`` for an arbitrary prefix
-length without re-running FPS from scratch:
-
-  - :func:`reconstruct_hausdorff` — chunked recompute, no Voronoi (fallback).
-  - :func:`reconstruct_hausdorff_with_voronoi` — only touches points whose
-    nearest center could have changed. ``O(|affected| × m)`` rather than
-    ``O(N × m)``. The bisect uses this path.
-"""
+"""Hausdorff-state reconstruction at bisect-mid prefixes"""
 
 from __future__ import annotations
 
@@ -31,7 +22,7 @@ def reconstruct_hausdorff(
     """Fallback (non-Voronoi) reconstruction. Returns ``(h_mid, cov)``."""
     device = X.device
 
-    # affected = rows whose nearest center came from added[m:] — they need recomputing.
+    # affected = rows whose nearest center came from added[m:] - they need recomputing.
     affected = v_final >= (n_snap + m)
 
     if m == len(added) or not affected.any():
@@ -41,7 +32,7 @@ def reconstruct_hausdorff(
         affected_idx = torch.where(affected)[0]
 
         if m == 0:
-            # no added centers in scope => fall back fully to snapshot state.
+            # no added centers in scope -> fall back fully to snapshot state.
             h_mid[affected_idx] = h_snap[affected_idx]
         else:
             # for each affected row, find its min squared distance to added[:m].
@@ -105,7 +96,7 @@ def reconstruct_hausdorff_with_voronoi(
         affected_idx = torch.where(affected_mask)[0]
 
         if m == 0:
-            # no new added centers — fall back fully to snapshot state.
+            # no new added centers - fall back fully to snapshot state.
             h_mid[affected_idx] = h_snap[affected_idx]
             voronoi_mid[affected_idx] = v_snap[affected_idx]
         else:

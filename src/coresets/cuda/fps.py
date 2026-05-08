@@ -1,7 +1,7 @@
 """Custom-kernel farthest-point sampling.
 
 Every per-step op (argmax, commit, Hausdorff update) runs on a custom CUDA
-kernel — no ``torch.argmax`` / ``torch.mv`` fallback. Faster than
+kernel - no ``torch.argmax`` / ``torch.mv`` fallback. Faster than
 :func:`coresets.fps` (torch-based) when ``N`` is very large; for smaller
 anchors, ``fps`` is plenty quick and avoids the JIT compile.
 """
@@ -13,8 +13,8 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from ._voronoi_step import voronoi_step
-from .ext import ensure_compiled, get_ext
+from ._internal import voronoi_step
+from .extension import ensure_compiled, get_ext
 
 
 def fps(
@@ -23,12 +23,12 @@ def fps(
     *,
     seed: Optional[Tensor] = None,
 ) -> Tensor:
-    """Custom-kernel FPS — same semantics as :func:`coresets.fps`.
+    """Custom-kernel FPS - same semantics as :func:`coresets.fps`.
 
     Args:
         X: ``(N, D)`` float32 CUDA.
         n_to_select: in ``[1, N]``.
-        seed: ``(M,)`` int64 — pre-selected indices (the first M picks).
+        seed: ``(M,)`` int64 - pre-selected indices (the first M picks).
             Defaults to ``[0]``.
 
     Returns ``(n_to_select,)`` int64 indices into ``X`` in selection order.
@@ -72,7 +72,7 @@ def fps(
         if n_seed == 0 or n_seed > n_to_select:
             raise ValueError(f"seed length {n_seed} must be in [1, n_to_select={n_to_select}]")
 
-        # commit each seed pick in order — fixes the FPS hierarchy's orientation.
+        # commit each seed pick in order - fixes the FPS hierarchy's orientation.
         for i in range(n_seed):
             new_idx = int(seed_g[i].item())
             selected[i] = new_idx
@@ -90,7 +90,7 @@ def fps(
         )
         start = 1
 
-    # inner loop: argmax_cuda => voronoi_step. The only D2H is the winning index.
+    # inner loop: argmax_cuda -> voronoi_step. The only D2H is the winning index.
     for i in range(start, n_to_select):
         # find the row farthest from the selected set (argmax over hausdorff).
         ext.argmax_cuda(hausdorff, block_vals, block_idxs, d_out_val, d_out_idx, n_total)

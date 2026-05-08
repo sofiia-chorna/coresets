@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from .._diag import PhaseTimer, Tracer
+from .._internal.diag import PhaseTimer, Tracer
 from ._shared import (
     Scratch,
     check_invariant_global,

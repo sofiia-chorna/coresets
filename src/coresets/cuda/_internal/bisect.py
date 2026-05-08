@@ -1,14 +1,15 @@
-"""Voronoi-accelerated bisect over a greedily-selected FPS prefix."""
+"""Voronoi-accelerated bisect over a greedily-selected FPS prefix"""
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import List
 
 import torch
 from torch import Tensor
 
-from ._reconstruct import reconstruct_hausdorff_with_voronoi
-from .ext import ensure_compiled, get_ext
+from ..extension import ensure_compiled, get_ext
+from .reconstruct import reconstruct_hausdorff_with_voronoi
+from .scratch import Scratch
 
 
 def bisect_voronoi_fast(
@@ -23,26 +24,13 @@ def bisect_voronoi_fast(
     step_seps: List[float],
     total_budget: int,
     n_snap: int,
-    scratch: Dict,
+    scratch: Scratch,
 ) -> int:
-    """Binary-search the maximum viable prefix length of ``added``"""
+    """Binary-search the maximum viable prefix length of ``added``."""
     ensure_compiled()
     ext = get_ext()
 
     N = X.shape[0]
-
-    # unpack persistent scratch - every probe reuses these buffers
-    full_fraction = float(scratch.get("full_fraction", 0.5))
-    block_vals = scratch["block_vals"]
-    block_idxs = scratch["block_idxs"]
-    d_out_val = scratch["d_out_val"]
-    d_out_idx = scratch["d_out_idx"]
-    sim_X_sel = scratch["sim_X_sel"]
-    sim_norms_sel = scratch["sim_norms_sel"]
-    sim_dSL_quarter = scratch["sim_dSL_quarter"]
-    d_local_sep = scratch["d_local_sep"]
-    d_viable = scratch["d_viable"]
-    sim_active_mask = scratch["sim_active_mask"]
 
     low, high, best = 0, len(added), 0
 
@@ -52,19 +40,19 @@ def bisect_voronoi_fast(
         points_left = total_budget - mid
         final_size = len(sel_start) + mid + points_left
 
-        # asking for more rows than exist => trivially viable
+        # asking for more rows than exist -> trivially viable.
         if final_size >= N:
             best, low = mid, mid + 1
             continue
 
-        # rebuild (h_mid, voronoi_mid) at this prefix length without re-running FPS
+        # rebuild (h_mid, voronoi_mid) at this prefix length without re-running FPS.
         h_mid, voronoi_mid = reconstruct_hausdorff_with_voronoi(
             X, norms, h_snap, h_final, v_final, v_snap,
             added, mid, n_snap, sel_start,
         )
 
         # kthvalue early-exit - viable iff sep_mid beats the (n_pos - points_left)-th
-        # smallest positive Hausdorff (an upper bound on cov after a viable fill)
+        # smallest positive Hausdorff (an upper bound on cov after a viable fill).
         n_positive = int((h_mid >= 0).sum().item())
         if 0 < points_left < n_positive:
             rank = n_positive - points_left
@@ -73,11 +61,11 @@ def bisect_voronoi_fast(
                 best, low = mid, mid + 1
                 continue
         elif points_left >= n_positive:
-            # we'll pick everything that's left => cov collapses to 0, trivially viable
+            # we'll pick everything that's left -> cov collapses to 0, trivially viable.
             best, low = mid, mid + 1
             continue
 
-        # no fill needed - viability collapses to a max comparison
+        # no fill needed - viability collapses to a max comparison.
         if points_left == 0:
             if sep_mid > float(h_mid.max().item()):
                 best, low = mid, mid + 1
@@ -85,7 +73,7 @@ def bisect_voronoi_fast(
                 high = mid - 1
             continue
 
-        # build initial-prefix tensors for the C++ sim (the rows the sim shouldn't re-pick)
+        # build initial-prefix tensors for the C++ sim (rows the sim shouldn't re-pick).
         sel_prefix = sel_start + added[:mid]
         if sel_prefix:
             sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=X.device)
@@ -94,13 +82,13 @@ def bisect_voronoi_fast(
             X_sel_init = torch.empty((0, X.shape[1]), dtype=X.dtype, device=X.device)
             norms_sel_init = torch.empty(0, dtype=norms.dtype, device=X.device)
 
-        # slow path: actually run the FPS-fill loop in C++ and read back the viability flag
+        # slow path: actually run the FPS-fill loop in C++ and read back the viability flag.
         is_viable, _steps = ext.simulate_fps_voronoi(
             X, norms, h_mid, voronoi_mid, X_sel_init, norms_sel_init,
-            float(sep_mid), int(points_left), full_fraction,
-            block_vals, block_idxs, d_out_val, d_out_idx,
-            sim_X_sel, sim_norms_sel, sim_dSL_quarter,
-            d_local_sep, d_viable, sim_active_mask,
+            float(sep_mid), int(points_left), scratch.full_fraction,
+            scratch.block_vals, scratch.block_idxs, scratch.d_out_val, scratch.d_out_idx,
+            scratch.sim_X_sel, scratch.sim_norms_sel, scratch.sim_dSL_quarter,
+            scratch.d_local_sep, scratch.d_viable, scratch.sim_active_mask,
         )
 
         if is_viable:

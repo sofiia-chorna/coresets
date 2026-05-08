@@ -22,7 +22,7 @@ import subprocess
 import torch
 from torch.utils.cpp_extension import load
 
-# module-level singletons — first call to ensure_compiled() builds the extension; later calls no-op.
+# module-level singletons - first call to ensure_compiled() builds the extension; later calls no-op.
 _compiled = False
 _extension = None
 
@@ -60,7 +60,7 @@ def ensure_compiled() -> None:
         raise FileNotFoundError(f"CUDA sources missing under {kernels_dir}/: {missing}")
 
     # first-time compile is ~15 s; subsequent runs reuse the cache under TORCH_EXTENSIONS_DIR.
-    print("Compiling custom CUDA FPS kernels… (first time, ~15 s)")
+    print("Compiling custom CUDA FPS kernels... (first time, ~15 s)")
     try:
         _extension = load(
             name="coreset_kernels",
