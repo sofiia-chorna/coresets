@@ -1,7 +1,7 @@
 // kernels/commit.cu — center-commit + Voronoi-skip-bound kernels.
 #include "_shared.cuh"
 
-// Basic commit: X[best]→X_sel[n_sel], record norm, mark h_m[best]=-1 and
+// Basic commit: X[best]=>X_sel[n_sel], record norm, mark h_m[best]=-1 and
 // voronoi_m[best]=n_sel. Caller passes best_idx via a 1-elt device tensor.
 template <typename scalar_t>
 __global__ void commit_center_kernel(const scalar_t* __restrict__ X,
@@ -23,7 +23,7 @@ __global__ void commit_center_kernel(const scalar_t* __restrict__ X,
 
 // Commit + on-device sep update + viability flag (kills per-step D2H inside
 // simulate_fps_voronoi). Viability: if the prior local_sep already exceeded
-// max(h), no future step can violate sep > cov → set d_viable=1.
+// max(h), no future step can violate sep > cov => set d_viable=1.
 template <typename scalar_t>
 __global__ void commit_center_with_sep_kernel(const scalar_t* __restrict__ X,
                                               const float* __restrict__ norms, scalar_t* X_sel,
@@ -38,7 +38,7 @@ __global__ void commit_center_with_sep_kernel(const scalar_t* __restrict__ X,
         float bv = *d_best_val;
         float sep = *d_local_sep;
         if (sep > bv)
-            *d_viable = 1;  // prior sep already beats current max(h) → viable
+            *d_viable = 1;  // prior sep already beats current max(h) => viable
         if (bv < sep)
             *d_local_sep = bv;  // running-min update
         norms_sel[n_sel] = norms[best_idx];

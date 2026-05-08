@@ -32,7 +32,7 @@ def _voronoi_step(
     x_new = X_sel[sel_pos]
     norm_new = norms_sel[sel_pos]
 
-    # first center → no triangle bound yet, so the full distance pass is the only option
+    # first center => no triangle bound yet, so the full distance pass is the only option
     if sel_pos == 0:
         fps_update(X, norms, d, hausdorff, voronoi, new_idx, sel_pos)
         return
@@ -97,7 +97,7 @@ def _reconstruct_hausdorff(
         affected_idx = torch.where(affected)[0]
 
         if m == 0:
-            # no added centers in scope → fall back fully to snapshot state
+            # no added centers in scope => fall back fully to snapshot state
             h_m[affected_idx] = h_snap[affected_idx]
         else:
             # for each affected row, find its min distance to added[:m]
@@ -161,7 +161,7 @@ def _bisect_voronoi(
         points_left = total_budget - mid
         final_size = len(sel_start) + mid + points_left
 
-        # asking for more than there are rows → trivially viable
+        # asking for more than there are rows => trivially viable
         if final_size >= N:
             best, low = mid, mid + 1
             continue
@@ -202,7 +202,7 @@ def _bisect_voronoi(
                 is_viable = True
                 break
 
-        # didn't early-exit → check the final state
+        # didn't early-exit => check the final state
         if not is_viable:
             cov = float(torch.max(h_m).item())
             is_viable = local_sep > cov
@@ -271,7 +271,7 @@ def accrete(
 
     full_threshold = int(0.5 * N)  # voronoi/full crossover; production default
 
-    # seed with the first anchor → fixes the orientation of the FPS hierarchy
+    # seed with the first anchor => fixes the orientation of the FPS hierarchy
     first = target[0]
     selected: List[int] = [first]
     selected_set: Set[int] = {first}

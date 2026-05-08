@@ -35,7 +35,7 @@ def _voronoi_step_dist(
     X_sel[sel_pos] = center
     norms_sel[sel_pos] = norm_new
 
-    # first center → no triangle bound yet, full distance pass over the whole matrix
+    # first center => no triangle bound yet, full distance pass over the whole matrix
     if sel_pos == 0:
         d = state.compute_distances(center)
         closer = d < h
@@ -102,7 +102,7 @@ def _reconstruct_hausdorff_dist(
         affected_idx = torch.where(affected)[0]
 
         if m == 0:
-            # no added centers in scope → fall back to snapshot state.
+            # no added centers in scope => fall back to snapshot state.
             h_m[affected_idx] = h_snap[affected_idx]
         else:
             # X_sel is replicated, so the added-point descriptors need no comm

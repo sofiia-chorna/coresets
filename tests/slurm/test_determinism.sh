@@ -44,7 +44,7 @@ TRACE_SHARD=$REPO/logs/trace_shard_${SLURM_JOB_ID}.tsv
 REF_FILE_B=$REPO/logs/ref_indices_${SLURM_JOB_ID}_cfgB.npy
 TRACE_SINGLE_B=$REPO/logs/trace_single_${SLURM_JOB_ID}_cfgB.tsv
 TRACE_SHARD_B=$REPO/logs/trace_shard_${SLURM_JOB_ID}_cfgB.tsv
-CFG_B_N=16383     # 16383 % 4 = 3 → last rank gets 4098, others 4095
+CFG_B_N=16383     # 16383 % 4 = 3 => last rank gets 4098, others 4095
 CFG_B_D=128
 CFG_B_K=8192
 
@@ -132,7 +132,7 @@ else
 fi
 
 # Phase 4 — Config B: single-GPU reference at N=16383, D=128, K=8192.
-#   N=16383 on world_size=4 → shard sizes [4095, 4095, 4095, 4098] (uneven).
+#   N=16383 on world_size=4 => shard sizes [4095, 4095, 4095, 4098] (uneven).
 #   Catches bugs specific to remainder-shard + D!=32 that Config A can't reach.
 set +e
 echo "=== Phase 4a: Config B single-GPU reference (N=$CFG_B_N, D=$CFG_B_D, K=$CFG_B_K) ==="

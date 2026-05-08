@@ -72,7 +72,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("reduce_and_commit_multi_cuda", &reduce_and_commit_multi_cuda,
           "Fused reduce-over-gather-buf + commit-center for multi-GPU sim. "
           "Updates d_local_sep/d_viable, norms_sel, h_shard/v_shard (owner only), "
-          "and copies X_full[best_idx] → X_sel[n_sel].",
+          "and copies X_full[best_idx] => X_sel[n_sel].",
           py::arg("gather_buf"), py::arg("world_size"), py::arg("X_full"), py::arg("norms_full"),
           py::arg("X_sel"), py::arg("norms_sel"), py::arg("h_shard"), py::arg("v_shard"),
           py::arg("d_local_sep"), py::arg("d_viable"), py::arg("shard_offset"), py::arg("N_shard"),

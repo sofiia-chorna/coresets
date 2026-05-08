@@ -13,7 +13,7 @@ import torch
 
 
 class Tracer:
-    """Append-only TSV log of every commit. ``None`` path → no-op."""
+    """Append-only TSV log of every commit. ``None`` path => no-op."""
 
     def __init__(self, path: Optional[str]):
         """Open the log file (truncating any existing content). ``None`` makes

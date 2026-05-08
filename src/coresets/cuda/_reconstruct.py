@@ -41,7 +41,7 @@ def reconstruct_hausdorff(
         affected_idx = torch.where(affected)[0]
 
         if m == 0:
-            # no added centers in scope → fall back fully to snapshot state.
+            # no added centers in scope => fall back fully to snapshot state.
             h_mid[affected_idx] = h_snap[affected_idx]
         else:
             # for each affected row, find its min squared distance to added[:m].

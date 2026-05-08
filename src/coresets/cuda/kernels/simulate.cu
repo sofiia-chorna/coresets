@@ -3,7 +3,7 @@
 
 // One bisect probe = one call. Starting from (h, v) with n_init centers,
 // can we add ``points_left`` more picks while keeping min separation ≥ sep?
-// Per step: argmax → commit-with-sep → dSL_quarter → voronoi_update.
+// Per step: argmax => commit-with-sep => dSL_quarter => voronoi_update.
 // Only D2H is a 4-byte d_viable read every 16 steps (early-exit signal).
 // Returns (is_viable, steps_used).
 

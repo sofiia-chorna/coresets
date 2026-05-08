@@ -88,7 +88,7 @@ __global__ void argmax_phase2_kernel(const float* __restrict__ block_vals,
 
     if (tid == 0) {
         d_out_val[0] = best_val;
-        d_out_idx[0] = (best_idx == INT_MAX) ? -1 : best_idx;  // sentinel → -1
+        d_out_idx[0] = (best_idx == INT_MAX) ? -1 : best_idx;  // sentinel => -1
     }
 }
 

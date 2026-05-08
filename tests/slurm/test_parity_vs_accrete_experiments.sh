@@ -111,7 +111,7 @@ else:
     print(f"        old[{diff[0]}]={old[diff[0]]}  new[{diff[0]}]={new[diff[0]]}")
     fail += 1
 
-# Timing tolerance: 5% on wall-time (warm GPU run, single iteration → noisy).
+# Timing tolerance: 5% on wall-time (warm GPU run, single iteration => noisy).
 t_old, t_new = sum_old["time_s"], sum_new["time_s"]
 delta_pct = 100.0 * (t_new - t_old) / t_old
 print(f"  timing: Δ = {t_new - t_old:+.1f}s ({delta_pct:+.1f}%)")

@@ -516,4 +516,4 @@ def _write_checkpoint(checkpoint_path, k, selected, target_size, verbose):
     os.replace(latest_tmp, latest_file)
 
     if verbose:
-        print(f"  [checkpoint] k={k} → {ckpt_file} ({len(coreset_np):,} points)")
+        print(f"  [checkpoint] k={k} => {ckpt_file} ({len(coreset_np):,} points)")

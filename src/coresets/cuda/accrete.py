@@ -80,7 +80,7 @@ def accrete(
     trace = Tracer(trace_path)
     profiler = PhaseTimer(enabled=profile, on_cuda=X.is_cuda)
 
-    # seed with the first anchor → fixes the orientation of the FPS hierarchy.
+    # seed with the first anchor => fixes the orientation of the FPS hierarchy.
     first = anchor_indices[0]
     selected: List[int] = [first]
     selected_set: Set[int] = {first}
@@ -217,12 +217,12 @@ def _resolve_max_k(max_k, n_total, dim, elem_bytes, device):
     bytes_per_sel_row = 2 * dim * elem_bytes + 5 * 4
     budget = int(free_bytes * 0.30)
 
-    # caller didn't pin → derive from free memory and dataset size.
+    # caller didn't pin => derive from free memory and dataset size.
     if max_k is None:
         max_k_mem = max(1, int(math.log2(max(1, budget // bytes_per_sel_row))))
         max_k = min(int(math.log2(n_total)), max_k_mem)
 
-    # caller pinned a value but it's too big → fail loud, before any GPU work.
+    # caller pinned a value but it's too big => fail loud, before any GPU work.
     max_sel = 2**max_k
     needed_bytes = 2 * max_sel * dim * elem_bytes + 5 * max_sel * 4
     if needed_bytes > budget:

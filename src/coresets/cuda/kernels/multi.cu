@@ -6,13 +6,13 @@
 //   h_shard / v_shard             : sharded, each rank owns a contiguous slice
 //
 // Per-step pipeline:
-//   argmax_cuda → pack_argmax_pair → AllGather[2G] → reduce_and_commit_multi
-//   → compute_dSL_quarter → voronoi_update_cuda
+//   argmax_cuda => pack_argmax_pair => AllGather[2G] => reduce_and_commit_multi
+//   => compute_dSL_quarter => voronoi_update_cuda
 //
 // Per step: one NCCL AllGather of 2G floats (~8G bytes — essentially free
 // over NVLink). D2H is 4 B every 16 steps for d_viable.
 
-// C3: Pack the global idx by int32→float bitcast (__int_as_float). A plain
+// C3: Pack the global idx by int32=>float bitcast (__int_as_float). A plain
 // `(float)idx` snaps indices ≥ 2^24 to the nearest representable float —
 // would pick the wrong winner at 100 M scale. The bitcast is lossless for
 // all int32 indices (covers ≤ 2^31, far above any production N).
@@ -172,7 +172,7 @@ std::tuple<bool, int64_t> simulate_fps_voronoi_multi(
     int64_t n_sel = (int64_t) n_init;
 
     for (int64_t step = 0; step < points_left; ++step) {
-        // 1. Local argmax over h_shard → (d_out_val, d_out_idx)
+        // 1. Local argmax over h_shard => (d_out_val, d_out_idx)
         //    Pack as (val, global_idx) float32 pair.
         if (N_shard > 0) {
             argmax_cuda(h_shard, block_vals, block_idxs, d_out_val, d_out_idx, N_shard);
@@ -259,7 +259,7 @@ std::tuple<bool, int64_t> simulate_fps_voronoi_multi(
 // Tie-break (smallest global idx on equal values) is unchanged.
 //
 // scalar_t: pack buffer is always float32; non-float scalar_t roundtrips
-// upcast→downcast losslessly because the row values are already
+// upcast=>downcast losslessly because the row values are already
 // representable in the source dtype.
 
 template <typename scalar_t>
@@ -429,8 +429,8 @@ void reduce_and_commit_multi_sharded_cuda(torch::Tensor gather_buf, int64_t worl
 }
 
 // simulate_fps_voronoi_multi_sharded — sharded-X variant of the multi sim.
-// Same pipeline, but pack_argmax_pair → pack_argmax_with_row,
-// reduce_and_commit_multi → reduce_and_commit_multi_sharded, and
+// Same pipeline, but pack_argmax_pair => pack_argmax_with_row,
+// reduce_and_commit_multi => reduce_and_commit_multi_sharded, and
 // gather_buf is [world_size·(3+D)] float32 instead of [world_size·2].
 
 std::tuple<bool, int64_t> simulate_fps_voronoi_multi_sharded(
@@ -467,7 +467,7 @@ std::tuple<bool, int64_t> simulate_fps_voronoi_multi_sharded(
     int64_t n_sel = (int64_t) n_init;
 
     for (int64_t step = 0; step < points_left; ++step) {
-        // 1. Local argmax over h_shard → (d_out_val, d_out_idx)
+        // 1. Local argmax over h_shard => (d_out_val, d_out_idx)
         //    Pack as (val, global_idx, norm, row) into argmax_local_pack.
         if (N_shard > 0) {
             argmax_cuda(h_shard, block_vals, block_idxs, d_out_val, d_out_idx, N_shard);

@@ -164,7 +164,7 @@ class DistributedFPSState:
         center = self.broadcast_descriptor(global_idx)
         d = self.compute_distances(center)
 
-        # rows that just got closer → reassign cell
+        # rows that just got closer => reassign cell
         closer = d < h
         v.masked_fill_(closer, sel_idx)
 

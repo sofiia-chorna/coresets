@@ -22,7 +22,7 @@ def voronoi_step(
     """Commit one center and update Hausdorff/Voronoi; fully fused on device.
 
     Three kernels run back-to-back:
-      1. ``commit_center_cuda`` — copy ``X[new_idx] → X_sel[sel_pos]``, mark
+      1. ``commit_center_cuda`` — copy ``X[new_idx] => X_sel[sel_pos]``, mark
          ``hausdorff[new_idx]=-1`` and ``voronoi[new_idx]=sel_pos``.
       2. ``compute_dSL_quarter_cuda`` — ``dSL_quarter[v] = ||X_sel[v]-x_new||²/4``
          for ``v < sel_pos``. Replaces a per-step GEMV + 3 elementwise ops.
@@ -32,7 +32,7 @@ def voronoi_step(
     ensure_compiled()
     ext = get_ext()
 
-    # commit_center_cuda reads new_idx from a device tensor — avoids a host→device push.
+    # commit_center_cuda reads new_idx from a device tensor — avoids a host=>device push.
     d_out_idx.fill_(new_idx)
     ext.commit_center_cuda(X, norms, X_sel, norms_sel, hausdorff, voronoi, d_out_idx, sel_pos)
 
@@ -40,7 +40,7 @@ def voronoi_step(
     norm_new = norms_sel[sel_pos : sel_pos + 1]
 
     if sel_pos == 0:
-        # first center → no triangle bound yet; full O(N·D) distance pass.
+        # first center => no triangle bound yet; full O(N·D) distance pass.
         ext.fps_update_cuda(X, norms, x_new, hausdorff, voronoi, norm_new, 0)
     else:
         # triangle bound first, then sparse Voronoi-skip update — most rows skip the matmul.

@@ -90,7 +90,7 @@ def fps(
         )
         start = 1
 
-    # inner loop: argmax_cuda → voronoi_step. The only D2H is the winning index.
+    # inner loop: argmax_cuda => voronoi_step. The only D2H is the winning index.
     for i in range(start, n_to_select):
         # find the row farthest from the selected set (argmax over hausdorff).
         ext.argmax_cuda(hausdorff, block_vals, block_idxs, d_out_val, d_out_idx, n_total)
