@@ -1,7 +1,4 @@
-"""Pure-Python reference implementation of FPS-accretion.
-
-Same guarantees as the CUDA path, ~4× slower. Kept for tests and validation.
-"""
+"""Pure-Python reference FPS-accretion. Same guarantees as the CUDA path, ~4× slower."""
 
 import math
 from typing import List, Optional, Set, Tuple
@@ -29,19 +26,24 @@ def _voronoi_step(
     Triangle inequality skips the distance compute for points that can't
     change Voronoi cell.
     """
+    # stash the new center in the replicated selected-rows table
     X_sel[sel_pos] = X[new_idx]
     norms_sel[sel_pos] = norms[new_idx]
     x_new = X_sel[sel_pos]
     norm_new = norms_sel[sel_pos]
 
+    # first center → no triangle bound yet, so the full distance pass is the only option
     if sel_pos == 0:
         fps_update(X, norms, d, hausdorff, voronoi, new_idx, sel_pos)
         return
 
+    # triangle bound: a row currently in voronoi cell j can switch to the new center
+    # only if ||X_sel[j] - x_new||^2/4 < hausdorff[row]. compute one bound per
+    # existing center, then look up each row's bound by its own cell
     dSL_quarter = (norms_sel[:sel_pos] + norm_new - 2.0 * (X_sel[:sel_pos] @ x_new)) * 0.25
-
     active_mask = dSL_quarter[voronoi] < hausdorff
 
+    # nobody can change cell — skip the distance pass entirely
     if not active_mask.any():
         hausdorff[new_idx] = -1.0
         voronoi[new_idx] = sel_pos
@@ -50,6 +52,7 @@ def _voronoi_step(
     n_active = int(active_mask.sum().item())
 
     if n_active <= full_threshold:
+        # sparse path: only compute distances for rows that might switch
         active_idx = torch.where(active_mask)[0]
         d_active = norms[active_idx] + norm_new - 2.0 * (X[active_idx] @ x_new)
         closer = d_active < hausdorff[active_idx]
@@ -57,12 +60,14 @@ def _voronoi_step(
         hausdorff[update_idx] = d_active[closer]
         voronoi[update_idx] = sel_pos
     else:
+        # too many active rows - the full O(N x D) matmul is cheaper than gather + sparse
         d.copy_(norms).add_(norm_new)
         torch.addmv(d, X, x_new, beta=1, alpha=-2, out=d)
         closer = d < hausdorff
         voronoi.masked_fill_(closer, sel_pos)
         torch.minimum(hausdorff, d, out=hausdorff)
 
+    # mark the new center so argmax can never pick it again
     hausdorff[new_idx] = -1.0
     voronoi[new_idx] = sel_pos
 
@@ -78,12 +83,11 @@ def _reconstruct_hausdorff(
     n_snap: int,
     sel_start: List[int],
 ) -> Tuple[Tensor, float]:
-    """Reconstruct hausdorff at prefix ``m``. Returns (h_m, cov_m).
-
-    Voronoi-aware: only recomputes distances for points whose nearest
-    selection was removed.
-    """
+    """Voronoi-aware reconstruction at prefix ``m``. Returns ``(h_m, cov_m)``."""
     device = X.device
+
+    # affected = rows whose nearest center in h_final came from added[m:]
+    # those need recomputing; everyone else's h_final entry is still correct
     affected = v_final >= (n_snap + m)
 
     if m == len(added) or not affected.any():
@@ -93,33 +97,38 @@ def _reconstruct_hausdorff(
         affected_idx = torch.where(affected)[0]
 
         if m == 0:
+            # no added centers in scope → fall back fully to snapshot state
             h_m[affected_idx] = h_snap[affected_idx]
         else:
+            # for each affected row, find its min distance to added[:m]
             added_t = torch.tensor(added[:m], dtype=torch.long, device=device)
-            X_add = X[added_t]
-            norms_add = norms[added_t]
-            n_aff = len(affected_idx)
-            norms_aff = norms[affected_idx]
-            X_aff = X[affected_idx]
-            min_to_added = torch.full((n_aff,), float("inf"), dtype=X.dtype, device=device)
-            chunk = max(1, 10_000_000 // max(n_aff, 1))
+            X_added = X[added_t]
+            norms_added = norms[added_t]
+            n_affected = len(affected_idx)
+            norms_affected = norms[affected_idx]
+            X_affected = X[affected_idx]
+
+            # chunk the m-axis to cap peak memory of the (n_affected, chunk) tile
+            min_to_added = torch.full((n_affected,), float("inf"), dtype=X.dtype, device=device)
+            chunk = max(1, 10_000_000 // max(n_affected, 1))
             for start in range(0, m, chunk):
                 end = min(start + chunk, m)
                 d_chunk = (
-                    norms_aff.unsqueeze(1)
-                    + norms_add[start:end].unsqueeze(0)
-                    - 2.0 * (X_aff @ X_add[start:end].T)
+                    norms_affected.unsqueeze(1)
+                    + norms_added[start:end].unsqueeze(0)
+                    - 2.0 * (X_affected @ X_added[start:end].T)
                 )
                 torch.minimum(min_to_added, d_chunk.min(dim=1).values, out=min_to_added)
+
+            # row-wise min: snapshot vs new added centers
             h_m[affected_idx] = torch.minimum(h_snap[affected_idx], min_to_added)
 
-    # Mask selected points
+    # mark all already-selected rows so they can't be picked again
     sel_prefix = sel_start + added[:m]
     sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=device)
     h_m[sel_t] = -1.0
 
-    cov_m = float(h_m.max().item())
-    return h_m, cov_m
+    return h_m, float(h_m.max().item())
 
 
 def _bisect_voronoi(
@@ -136,12 +145,13 @@ def _bisect_voronoi(
 ) -> int:
     """Binary-search the max viable prefix via Voronoi reconstruction.
 
-    Reconstructs any prefix's hausdorff in O(|affected| × m) instead of
-    storing the full O(pool × N) history. Uses kth-value as a fast path.
+    Reconstructs any prefix's hausdorff in ``O(|affected| x m)`` instead of
+    storing the full ``O(pool x N)`` history. Uses kth-value as a fast path.
     """
     N = X.shape[0]
     low, high, best = 0, len(added), 0
 
+    # sim scratch — reused across every probe so we don't realloc
     d_sim = torch.empty(N, dtype=X.dtype, device=X.device)
     v_dummy = torch.zeros(N, dtype=torch.long, device=X.device)
 
@@ -151,40 +161,32 @@ def _bisect_voronoi(
         points_left = total_budget - mid
         final_size = len(sel_start) + mid + points_left
 
+        # asking for more than there are rows → trivially viable
         if final_size >= N:
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
             continue
 
+        # rebuild (h_m, cov_m) at this prefix length without re-running FPS
         h_m, _ = _reconstruct_hausdorff(
-            X,
-            norms,
-            h_snap,
-            h_final,
-            v_final,
-            added,
-            mid,
-            n_snap,
-            sel_start,
+            X, norms, h_snap, h_final, v_final, added, mid, n_snap, sel_start,
         )
 
-        # Fast path: kth-value bound
+        # fast path: kth-value bound. if we can pick all positive rows then
+        # cov collapses to 0; otherwise cov is bounded above by the
+        # (n_positive - points_left)-th smallest positive value.
         n_positive = int((h_m >= 0).sum().item())
-        if points_left > 0 and points_left < n_positive:
+        if 0 < points_left < n_positive:
             rank = n_positive - points_left
             pos_vals = h_m[h_m >= 0]
             cov_upper = float(torch.kthvalue(pos_vals, rank).values.item())
             if sep_mid > cov_upper:
-                best = mid
-                low = mid + 1
+                best, low = mid, mid + 1
                 continue
         elif points_left >= n_positive:
-            # Will select everything
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
             continue
 
-        # Slow path: simulate unrestricted FPS fill
+        # slow path: actually simulate the unrestricted FPS fill and test sep > cov
         local_sep = sep_mid
         n_sel = len(sel_start) + mid
         is_viable = False
@@ -195,17 +197,18 @@ def _bisect_voronoi(
             fps_update(X, norms, d_sim, h_m, v_dummy, fps_idx, n_sel)
             n_sel += 1
             cov = float(torch.max(h_m).item())
+            # early-exit: once sep > cov holds, any further fill keeps it true
             if local_sep > cov:
                 is_viable = True
                 break
 
+        # didn't early-exit → check the final state
         if not is_viable:
             cov = float(torch.max(h_m).item())
             is_viable = local_sep > cov
 
         if is_viable:
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
         else:
             high = mid - 1
 
@@ -220,16 +223,29 @@ def accrete(
     max_k: Optional[int] = None,
     verbose: bool = True,
 ) -> Tensor:
-    """Voronoi-accelerated accretion. Coverage guarantee: sep > cov at every 2^k.
+    """Voronoi-accelerated accretion (pure torch reference). ``sep > cov`` at every 2^k.
 
     Three wins over level-by-level FPS:
       1. Hausdorff/voronoi state carried forward across levels (no replay).
       2. Triangle-inequality skip in the per-step Hausdorff update.
-      3. Voronoi-based bisection — O(|affected| × m × D) per probe instead
-         of storing the full O(pool × N) history.
+      3. Voronoi-based bisection — ``O(|affected| x  m x D)`` per probe instead
+         of storing the full ``O(pool x N)`` history.
+
+    Args:
+        X_anchor: ``(n_anchor, D)`` anchor features.
+        X_candidates: ``(n_cand, D)`` candidate features. Pass an empty
+            ``(0, D)`` if there are none.
+        anchor_order: ``(n_anchor,)`` int64 — anchor FPS hierarchy
+            (the first ``2**k`` entries form the anchor block at level k).
+        candidate_order: kept for API symmetry; unused by the current pure-torch
+            reference (the multi-GPU CUDA path consumes it).
+        max_k: final coreset size = ``2 ** max_k``. Defaults to
+            ``log2(N_total)``.
+        verbose: per-level progress print.
 
     Returns ``(2^max_k,) int64`` indices over ``cat([X_anchor, X_candidates])``.
     """
+    # combine anchor + candidates into one global matrix; idx < N_A came from anchor
     N_A, N_C = X_anchor.shape[0], X_candidates.shape[0]
     N = N_A + N_C
     D = X_anchor.shape[1]
@@ -238,36 +254,31 @@ def accrete(
 
     if max_k is None:
         max_k = int(math.log2(N))
-    max_k_A = int(math.log2(N_A)) if N_A > 1 else 0
 
+    # nested anchor blocks: B_k = first 2^k anchors. accretion targets B_k at level k
     target = anchor_order.tolist()
     nested_blocks: List[Set[int]] = [set(target[: min(2**i, N_A)]) for i in range(1, max_k + 1)]
 
+    # state carried forward across levels - no per-level replay
     hausdorff = torch.full((N,), float("inf"), dtype=X.dtype, device=X.device)
     voronoi = torch.zeros(N, dtype=torch.long, device=X.device)
     d = torch.empty(N, dtype=X.dtype, device=X.device)
 
+    # selected-rows table — reused by the triangle bound to skip re-indexing X
     max_sel = 2**max_k
     X_sel = torch.empty((max_sel, D), dtype=X.dtype, device=X.device)
     norms_sel = torch.empty(max_sel, dtype=X.dtype, device=X.device)
 
-    full_threshold = int(0.5 * N)  # Voronoi/full-pass crossover; production default
+    full_threshold = int(0.5 * N)  # voronoi/full crossover; production default
 
+    # seed with the first anchor → fixes the orientation of the FPS hierarchy
     first = target[0]
-    current_sel: List[int] = [first]
+    selected: List[int] = [first]
     selected_set: Set[int] = {first}
-    current_sep = float("inf")
+    sep = float("inf")
     _voronoi_step(
-        X,
-        norms,
-        d,
-        hausdorff,
-        voronoi,
-        X_sel,
-        norms_sel,
-        first,
-        0,
-        full_threshold,
+        X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
+        first, 0, full_threshold,
     )
 
     if verbose:
@@ -280,147 +291,116 @@ def accrete(
 
     for k in range(1, max_k + 1):
         target_size = 2**k
-        points_needed = target_size - len(current_sel)
-        if points_needed <= 0:
+        budget = target_size - len(selected)
+        if budget <= 0:
             continue
 
-        # Target blocks from A's hierarchy: B_k, B_{k+1}, ...
-        target_blocks = nested_blocks[k - 1 :]
-
-        for block_pool in target_blocks:
-            if points_needed <= 0:
+        # try to satisfy budget from each higher-level block in turn (B_k, B_{k+1}, ...).
+        # this preserves anchor-hierarchy at every level k where 2^k ≤ N_anchor
+        for block in nested_blocks[k - 1 :]:
+            if budget <= 0:
                 break
 
-            desired = sorted(block_pool - selected_set)
+            desired = sorted(block - selected_set)
             if not desired:
                 continue
 
-            # --- Snapshot state before restricted FPS ---
+            # snapshot pre-block state — we may roll back if some forward picks aren't viable
             h_snap = hausdorff.clone()
             v_snap = voronoi.clone()
-            sep_snap = current_sep
-            n_snap = len(current_sel)
-            sel_snap = list(current_sel)
+            sep_snap = sep
+            n_snap = len(selected)
+            sel_snap = list(selected)
 
-            # --- Run full restricted FPS (voronoi-accelerated, no history) ---
+            # --- forward FPS over the desired pool, recording sep at each step ----------
             added: List[int] = []
             step_seps: List[float] = [sep_snap]
             pool_buf = list(desired)
-            max_add = min(points_needed, len(pool_buf))
+            max_add = min(budget, len(pool_buf))
 
-            for step in range(max_add):
+            for _step in range(max_add):
+                # argmax restricted to the unpicked pool
                 pool_t = torch.tensor(pool_buf, dtype=torch.long, device=X.device)
                 best_pos = int(torch.argmax(hausdorff[pool_t]).item())
                 best_idx = pool_buf[best_pos]
                 best_val = float(hausdorff[best_idx].item())
 
+                # all remaining pool members are already-selected (h=-1) — stop
                 if best_val <= 0:
                     break
 
-                current_sep = min(current_sep, best_val)
-                step_seps.append(current_sep)
+                sep = min(sep, best_val)
+                step_seps.append(sep)
                 added.append(best_idx)
 
-                sel_pos = len(current_sel)
-                current_sel.append(best_idx)
+                sel_pos = len(selected)
+                selected.append(best_idx)
                 selected_set.add(best_idx)
 
                 _voronoi_step(
-                    X,
-                    norms,
-                    d,
-                    hausdorff,
-                    voronoi,
-                    X_sel,
-                    norms_sel,
-                    best_idx,
-                    sel_pos,
-                    full_threshold,
+                    X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
+                    best_idx, sel_pos, full_threshold,
                 )
 
+                # swap winner to the back, then pop — keeps pool_buf compact without realloc
                 pool_buf[best_pos] = pool_buf[-1]
                 pool_buf.pop()
 
             if not added:
                 continue
 
-            # --- Save final state, then bisect ---
+            # --- bisect: largest m for which keeping added[:m] still admits a viable fill ---
             h_final = hausdorff.clone()
             v_final = voronoi.clone()
 
             best_m = _bisect_voronoi(
-                X,
-                norms,
-                h_snap,
-                h_final,
-                v_final,
-                sel_snap,
-                added,
-                step_seps,
-                points_needed,
-                n_snap,
+                X, norms, h_snap, h_final, v_final,
+                sel_snap, added, step_seps, budget, n_snap,
             )
 
-            # --- Restore snapshot and replay best_m steps ---
+            # --- restore snapshot, then replay only the best_m steps that survived bisect ---
             hausdorff.copy_(h_snap)
             voronoi.copy_(v_snap)
-            current_sel = list(sel_snap)
+            selected = list(sel_snap)
             selected_set = set(sel_snap)
-            current_sep = sep_snap
+            sep = sep_snap
 
             for j in range(best_m):
                 idx = added[j]
-                sel_pos = len(current_sel)
-                current_sel.append(idx)
+                sel_pos = len(selected)
+                selected.append(idx)
                 selected_set.add(idx)
-                current_sep = step_seps[j + 1]
+                sep = step_seps[j + 1]
 
                 _voronoi_step(
-                    X,
-                    norms,
-                    d,
-                    hausdorff,
-                    voronoi,
-                    X_sel,
-                    norms_sel,
-                    idx,
-                    sel_pos,
-                    full_threshold,
+                    X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
+                    idx, sel_pos, full_threshold,
                 )
 
-            points_needed -= best_m
+            budget -= best_m
 
-        # Fill remainder with unrestricted FPS (voronoi-accelerated)
-        while points_needed > 0:
+        # fill remainder with unrestricted FPS over the whole matrix
+        while budget > 0:
             best_idx = int(torch.argmax(hausdorff).item())
             best_val = float(hausdorff[best_idx].item())
 
-            current_sep = min(current_sep, best_val)
-            sel_pos = len(current_sel)
-            current_sel.append(best_idx)
+            sep = min(sep, best_val)
+            sel_pos = len(selected)
+            selected.append(best_idx)
             selected_set.add(best_idx)
 
             _voronoi_step(
-                X,
-                norms,
-                d,
-                hausdorff,
-                voronoi,
-                X_sel,
-                norms_sel,
-                best_idx,
-                sel_pos,
-                full_threshold,
+                X, norms, d, hausdorff, voronoi, X_sel, norms_sel,
+                best_idx, sel_pos, full_threshold,
             )
-            points_needed -= 1
+            budget -= 1
 
-        # End-of-level Gonzalez invariant: sep > cov. Hard-abort only on a
-        # gross violation (well below float32 noise); the authoritative check
-        # is the float64 post-hoc verifier.
+        # end-of-level Gonzalez invariant: sep > cov. Hard-abort only on a
+        # gross violation (well below float32 noise); the f64 verifier is authoritative
         GROSS_VIOLATION_REL = 1e-3
 
         cov_sq = max(0.0, float(hausdorff.max().item()))
-        sep_sq = current_sep
+        sep_sq = sep
         sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
         cov_val = math.sqrt(cov_sq)
         rel_gap = (
@@ -435,7 +415,7 @@ def accrete(
             )
 
         if verbose:
-            sel_set = set(current_sel[:target_size])
+            sel_set = set(selected[:target_size])
             in_bk = len(sel_set & nested_blocks[k - 1])
             from_a = sum(1 for s in sel_set if s < N_A)
             rel_gap_str = f"{rel_gap:>11.3e}" if math.isfinite(rel_gap) else f"{'inf':>11}"
@@ -445,4 +425,4 @@ def accrete(
                 f"{sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str}"
             )
 
-    return torch.tensor(current_sel, dtype=torch.long, device=X.device)
+    return torch.tensor(selected, dtype=torch.long, device=X.device)

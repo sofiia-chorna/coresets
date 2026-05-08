@@ -173,7 +173,20 @@ def _step_dir(run_dir: Path, step_idx: int, name: str) -> Path:
 
 @dataclass
 class StepStats:
-    """Summary of a step. Forms the body of ``step.json``."""
+    """Summary of a step. Forms the body of ``step.json``.
+
+    Fields:
+        max_k: final coreset size produced by this step (``= 2 ** max_k``).
+        n_anchor: number of anchor rows fed in.
+        n_candidates: number of candidate rows fed in.
+        walltime_s: wall-clock time of the step (seconds).
+        peak_mem_gb: peak GPU memory used (informational).
+        max_rel_gap: worst per-level ``sep_sq / cov_sq - 1`` seen in this step.
+        success: ``False`` if the step aborted; ``LATEST`` is **not** advanced
+            in that case.
+        parents: step names this step builds on (``[]`` for a from-scratch step).
+        candidate_sources: data-source names whose rows formed the candidate pool.
+    """
 
     max_k: int
     n_anchor: int

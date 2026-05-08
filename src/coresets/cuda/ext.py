@@ -1,8 +1,7 @@
 """JIT-compiled CUDA extension shared across the ``cuda`` subpackage.
 
-The extension is built from sources in ``kernels/`` on first use. All modules
-in :mod:`coresets.cuda` go through :func:`get_ext` (compile on first call,
-cached afterwards).
+Built from sources in ``kernels/`` on first use; cached afterwards. All
+:mod:`coresets.cuda` modules go through :func:`get_ext`.
 
 Exposed kernels:
   fps_update_cuda                : dense Hausdorff update (1 warp per row)
@@ -23,8 +22,9 @@ import subprocess
 import torch
 from torch.utils.cpp_extension import load
 
+# module-level singletons — first call to ensure_compiled() builds the extension; later calls no-op.
 _compiled = False
-_extension = None  # populated on first ensure_compiled()
+_extension = None
 
 
 def ensure_compiled() -> None:
@@ -36,7 +36,7 @@ def ensure_compiled() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. Run on a GPU node (#SBATCH --gres=gpu:1).")
 
-    # Auto-detect CUDA_HOME from `which nvcc` if the env var isn't set.
+    # auto-detect CUDA_HOME from `which nvcc` if the env var isn't set.
     if "CUDA_HOME" not in os.environ:
         try:
             nvcc_path = subprocess.check_output(["which", "nvcc"]).decode().strip()
@@ -48,6 +48,7 @@ def ensure_compiled() -> None:
                 "Load CUDA modules first (e.g. `module load cuda/12.5.1`)."
             ) from e
 
+    # the kernels live next to this file under kernels/.
     here = os.path.dirname(os.path.abspath(__file__))
     kernels_dir = os.path.join(here, "kernels")
     sources = [
@@ -58,6 +59,7 @@ def ensure_compiled() -> None:
     if missing:
         raise FileNotFoundError(f"CUDA sources missing under {kernels_dir}/: {missing}")
 
+    # first-time compile is ~15 s; subsequent runs reuse the cache under TORCH_EXTENSIONS_DIR.
     print("Compiling custom CUDA FPS kernels… (first time, ~15 s)")
     try:
         _extension = load(

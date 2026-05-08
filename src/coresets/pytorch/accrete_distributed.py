@@ -29,11 +29,13 @@ def _voronoi_step_dist(
     Triangle-inequality check uses replicated X_sel/norms_sel (no comm).
     Distance compute uses the distributed state (broadcast + allgather).
     """
+    # broadcast the new center from its owner; cache it in the replicated table
     center = state.broadcast_descriptor(global_idx)
     norm_new = (center * center).sum()
     X_sel[sel_pos] = center
     norms_sel[sel_pos] = norm_new
 
+    # first center → no triangle bound yet, full distance pass over the whole matrix
     if sel_pos == 0:
         d = state.compute_distances(center)
         closer = d < h
@@ -42,11 +44,14 @@ def _voronoi_step_dist(
         h[global_idx] = -1.0
         return
 
-    # Triangle-inequality bound (replicated, no comm).
+    # triangle bound — same idea as the single-GPU path, runs purely on replicated state
     dSL_quarter = (norms_sel[:sel_pos] + norm_new - 2.0 * (X_sel[:sel_pos] @ center)) * 0.25
+
+    # clamp v in case it points past sel_pos for already-marked rows (h=-1).
     vl_clamped = torch.clamp(v, max=sel_pos - 1)
     active_mask = dSL_quarter[vl_clamped] < h
 
+    # nobody can change cell - skip the distance pass entirely.
     if not active_mask.any():
         h[global_idx] = -1.0
         v[global_idx] = sel_pos
@@ -55,11 +60,13 @@ def _voronoi_step_dist(
     n_active = int(active_mask.sum().item())
 
     if n_active <= full_threshold:
+        # sparse comm: each rank computes only its own active rows; gather is unchanged
         d = state.compute_distances_sparse(center, active_mask)
         closer = (d < h) & active_mask
         h[closer] = d[closer]
         v.masked_fill_(closer, sel_pos)
     else:
+        # too many active rows — fall back to the full distributed distance pass
         d = state.compute_distances(center)
         closer = d < h
         v.masked_fill_(closer, sel_pos)
@@ -81,9 +88,11 @@ def _reconstruct_hausdorff_dist(
     n_snap: int,
     sel_start: List[int],
 ) -> Tuple[Tensor, float]:
-    """Reconstruct hausdorff at prefix *m*. Distributes affected-point compute."""
+    """Reconstruct hausdorff at prefix ``m``. Distributes affected-point compute."""
     device = state.device
     N = state.N
+
+    # affected = rows whose nearest center came from added[m:] — recompute against added[:m].
     affected = v_final >= (n_snap + m)
 
     if m == len(added) or not affected.any():
@@ -93,63 +102,63 @@ def _reconstruct_hausdorff_dist(
         affected_idx = torch.where(affected)[0]
 
         if m == 0:
+            # no added centers in scope → fall back to snapshot state.
             h_m[affected_idx] = h_snap[affected_idx]
         else:
-            # X_sel is replicated; no comm needed for added-point descriptors.
-            X_add = X_sel[n_snap : n_snap + m]
-            norms_add = norms_sel[n_snap : n_snap + m]
+            # X_sel is replicated, so the added-point descriptors need no comm
+            X_added = X_sel[n_snap : n_snap + m]
+            norms_added = norms_sel[n_snap : n_snap + m]
 
-            n_aff = len(affected_idx)
+            # global "min distance to added" buffer; gets AllReduce-MINed at the end
+            n_affected = len(affected_idx)
             min_to_added = torch.full(
-                (n_aff,),
-                float("inf"),
-                dtype=state.dtype,
-                device=device,
+                (n_affected,), float("inf"), dtype=state.dtype, device=device,
             )
 
-            # Each rank handles its in-shard affected rows.
+            # each rank only handles its in-shard affected rows; the rest stay at inf
+            # and get filled in by AllReduce-MIN below.
             local_mask = (affected_idx >= state.my_offset) & (
                 affected_idx < state.my_offset + state.n_local
             )
 
             if local_mask.any():
+                # translate global affected indices into this rank's local row ids
                 local_global = affected_idx[local_mask]
                 local_idx = local_global - state.my_offset
-                norms_aff = state.norms_local[local_idx]
-                X_aff = state.X_local[local_idx]
+                norms_affected = state.norms_local[local_idx]
+                X_affected = state.X_local[local_idx]
 
+                # chunk the m-axis to cap peak memory of the (n_local_affected, chunk) tile.
+                n_local_affected = int(local_mask.sum().item())
                 min_local = torch.full(
-                    (int(local_mask.sum().item()),),
-                    float("inf"),
-                    dtype=state.dtype,
-                    device=device,
+                    (n_local_affected,), float("inf"), dtype=state.dtype, device=device,
                 )
-                chunk = max(1, 10_000_000 // max(int(local_mask.sum().item()), 1))
+                chunk = max(1, 10_000_000 // max(n_local_affected, 1))
                 for start in range(0, m, chunk):
                     end = min(start + chunk, m)
                     d_chunk = (
-                        norms_aff.unsqueeze(1)
-                        + norms_add[start:end].unsqueeze(0)
-                        - 2.0 * (X_aff @ X_add[start:end].T)
+                        norms_affected.unsqueeze(1)
+                        + norms_added[start:end].unsqueeze(0)
+                        - 2.0 * (X_affected @ X_added[start:end].T)
                     )
-                    torch.minimum(
-                        min_local,
-                        d_chunk.min(dim=1).values,
-                        out=min_local,
-                    )
+                    torch.minimum(min_local, d_chunk.min(dim=1).values, out=min_local)
 
+                # scatter local results back into the global "affected" buffer
                 local_positions = torch.where(local_mask)[0]
                 min_to_added[local_positions] = min_local
 
+            # collapse per-rank contributions: every rank ends up with the global min
             dist.all_reduce(min_to_added, op=dist.ReduceOp.MIN)
+
+            # row-wise min: snapshot vs new added centers
             h_m[affected_idx] = torch.minimum(h_snap[affected_idx], min_to_added)
 
+    # mark all already-selected rows
     sel_prefix = sel_start + added[:m]
     sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=device)
     h_m[sel_t] = -1.0
 
-    cov_m = float(h_m.max().item())
-    return h_m, cov_m
+    return h_m, float(h_m.max().item())
 
 
 def _bisect_voronoi_dist(
@@ -170,6 +179,7 @@ def _bisect_voronoi_dist(
     device = state.device
     low, high, best = 0, len(added), 0
 
+    # voronoi scratch for the inner sim — value is unused (only h matters here).
     v_dummy = torch.zeros(N, dtype=torch.long, device=device)
 
     while low <= high:
@@ -178,40 +188,30 @@ def _bisect_voronoi_dist(
         points_left = total_budget - mid
         final_size = len(sel_start) + mid + points_left
 
+        # asking for more rows than exist => trivially viable
         if final_size >= N:
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
             continue
 
         h_m, _ = _reconstruct_hausdorff_dist(
-            state,
-            X_sel,
-            norms_sel,
-            h_snap,
-            h_final,
-            v_final,
-            added,
-            mid,
-            n_snap,
-            sel_start,
+            state, X_sel, norms_sel, h_snap, h_final, v_final,
+            added, mid, n_snap, sel_start,
         )
 
-        # Fast path: kth-value bound (h_m is replicated; no comm).
+        # fast path: kth-value bound (h_m is replicated; no comm)
         n_positive = int((h_m >= 0).sum().item())
-        if points_left > 0 and points_left < n_positive:
+        if 0 < points_left < n_positive:
             rank_k = n_positive - points_left
             pos_vals = h_m[h_m >= 0]
             cov_upper = float(torch.kthvalue(pos_vals, rank_k).values.item())
             if sep_mid > cov_upper:
-                best = mid
-                low = mid + 1
+                best, low = mid, mid + 1
                 continue
         elif points_left >= n_positive:
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
             continue
 
-        # Slow path: simulate the unrestricted FPS fill (distributed updates).
+        # slow path: simulate the unrestricted FPS fill (each step is a distributed update)
         local_sep = sep_mid
         n_sel = len(sel_start) + mid
         is_viable = False
@@ -222,17 +222,18 @@ def _bisect_voronoi_dist(
             state.update_on(h_m, v_dummy, fps_idx, n_sel)
             n_sel += 1
             cov = float(torch.max(h_m).item())
+            # early-exit: once sep > cov holds, further fills keep it true
             if local_sep > cov:
                 is_viable = True
                 break
 
+        # didn't early-exit => check the final state
         if not is_viable:
             cov = float(torch.max(h_m).item())
             is_viable = local_sep > cov
 
         if is_viable:
-            best = mid
-            low = mid + 1
+            best, low = mid, mid + 1
         else:
             high = mid - 1
 
@@ -250,10 +251,21 @@ def accrete(
 ) -> Tensor:
     """Multi-GPU Voronoi-accelerated accretion (distributed reference).
 
-    Same coverage guarantee as ``pytorch.accrete``. X sharded across GPUs;
-    hausdorff/voronoi/X_sel replicated. Returns ``(2^max_k,) int64`` global
-    coreset indices, identical on every rank.
+    Same coverage guarantee as :func:`pytorch.accrete`. X sharded across GPUs;
+    hausdorff/voronoi/X_sel replicated.
+
+    Args:
+        X_local: ``(n_local, D)`` — this rank's slice of ``cat([X_anchor, X_candidates])``.
+            Concatenating in rank order must reproduce the global matrix.
+        anchor_order: ``(n_anchor,)`` int64 — anchor FPS hierarchy (global indices).
+        n_anchor: number of anchor rows in the global matrix.
+        rank, world_size: distributed group geometry.
+        max_k: final coreset size = ``2 ** max_k``. Defaults to ``log2(N_global)``.
+        verbose: per-level progress print on rank 0.
+
+    Returns ``(2^max_k,) int64`` global coreset indices, identical on every rank.
     """
+    # discover the global layout from the per-rank shards (one AllGather inside)
     state = DistributedFPSState(X_local, rank, world_size)
     N = state.N
     D = state.D
@@ -263,11 +275,13 @@ def accrete(
     if max_k is None:
         max_k = int(math.log2(N))
 
+    # nested anchor blocks, same as single-GPU
     target = anchor_order.tolist()
     nested_blocks: List[Set[int]] = [
         set(target[: min(2**i, n_anchor)]) for i in range(1, max_k + 1)
     ]
 
+    # replicated state: every rank holds the full hausdorff/voronoi
     hausdorff = torch.full((N,), float("inf"), dtype=dtype, device=device)
     voronoi = torch.zeros(N, dtype=torch.long, device=device)
 
@@ -275,21 +289,16 @@ def accrete(
     X_sel = torch.empty((max_sel, D), dtype=dtype, device=device)
     norms_sel = torch.empty(max_sel, dtype=dtype, device=device)
 
-    full_threshold = int(0.5 * N)  # Voronoi/full-pass crossover; production default
+    full_threshold = int(0.5 * N)  # voronoi/full crossover; production default
 
+    # seed with the first anchor
     first = target[0]
-    current_sel: List[int] = [first]
+    selected: List[int] = [first]
     selected_set: Set[int] = {first}
-    current_sep = float("inf")
+    sep = float("inf")
     _voronoi_step_dist(
-        state,
-        hausdorff,
-        voronoi,
-        X_sel,
-        norms_sel,
-        first,
-        0,
-        full_threshold,
+        state, hausdorff, voronoi, X_sel, norms_sel,
+        first, 0, full_threshold,
     )
 
     if verbose and rank == 0:
@@ -302,39 +311,35 @@ def accrete(
 
     for k in range(1, max_k + 1):
         target_size = 2**k
-        points_needed = target_size - len(current_sel)
-        if points_needed <= 0:
+        budget = target_size - len(selected)
+        if budget <= 0:
             continue
 
-        target_blocks = nested_blocks[k - 1 :]
-
-        for block_pool in target_blocks:
-            if points_needed <= 0:
+        # try each higher-level block in turn — preserves anchor hierarchy
+        for block in nested_blocks[k - 1 :]:
+            if budget <= 0:
                 break
 
-            desired = sorted(block_pool - selected_set)
+            desired = sorted(block - selected_set)
             if not desired:
                 continue
 
-            # --- Snapshot state before restricted FPS ---
+            # snapshot pre-block state (everything is replicated, so .clone() is enough)
             h_snap = hausdorff.clone()
             v_snap = voronoi.clone()
-            sep_snap = current_sep
-            n_snap = len(current_sel)
-            sel_snap = list(current_sel)
+            sep_snap = sep
+            n_snap = len(selected)
+            sel_snap = list(selected)
 
-            # --- Run full restricted FPS (voronoi-accelerated) ---
+            # --- forward FPS over the desired pool ------------------------------------
             added: List[int] = []
             step_seps: List[float] = [sep_snap]
             pool_buf = list(desired)
-            max_add = min(points_needed, len(pool_buf))
+            max_add = min(budget, len(pool_buf))
 
-            for step in range(max_add):
-                pool_t = torch.tensor(
-                    pool_buf,
-                    dtype=torch.long,
-                    device=device,
-                )
+            for _step in range(max_add):
+                # argmax restricted to the pool — runs on the replicated h, no comm.
+                pool_t = torch.tensor(pool_buf, dtype=torch.long, device=device)
                 best_pos = int(torch.argmax(hausdorff[pool_t]).item())
                 best_idx = pool_buf[best_pos]
                 best_val = float(hausdorff[best_idx].item())
@@ -342,23 +347,18 @@ def accrete(
                 if best_val <= 0:
                     break
 
-                current_sep = min(current_sep, best_val)
-                step_seps.append(current_sep)
+                sep = min(sep, best_val)
+                step_seps.append(sep)
                 added.append(best_idx)
 
-                sel_pos = len(current_sel)
-                current_sel.append(best_idx)
+                sel_pos = len(selected)
+                selected.append(best_idx)
                 selected_set.add(best_idx)
 
+                # the per-step distance update *does* need comm (broadcast + allgather)
                 _voronoi_step_dist(
-                    state,
-                    hausdorff,
-                    voronoi,
-                    X_sel,
-                    norms_sel,
-                    best_idx,
-                    sel_pos,
-                    full_threshold,
+                    state, hausdorff, voronoi, X_sel, norms_sel,
+                    best_idx, sel_pos, full_threshold,
                 )
 
                 pool_buf[best_pos] = pool_buf[-1]
@@ -367,77 +367,56 @@ def accrete(
             if not added:
                 continue
 
-            # --- Save final state, then bisect ---
+            # --- bisect: largest viable prefix of `added` -----------------------------
             h_final = hausdorff.clone()
             v_final = voronoi.clone()
 
             best_m = _bisect_voronoi_dist(
-                state,
-                X_sel,
-                norms_sel,
-                h_snap,
-                h_final,
-                v_final,
-                sel_snap,
-                added,
-                step_seps,
-                points_needed,
-                n_snap,
+                state, X_sel, norms_sel, h_snap, h_final, v_final,
+                sel_snap, added, step_seps, budget, n_snap,
             )
 
-            # --- Restore snapshot and replay best_m steps ---
+            # --- restore snapshot, replay best_m steps --------------------------------
             hausdorff.copy_(h_snap)
             voronoi.copy_(v_snap)
-            current_sel = list(sel_snap)
+            selected = list(sel_snap)
             selected_set = set(sel_snap)
-            current_sep = sep_snap
+            sep = sep_snap
 
             for j in range(best_m):
                 idx = added[j]
-                sel_pos = len(current_sel)
-                current_sel.append(idx)
+                sel_pos = len(selected)
+                selected.append(idx)
                 selected_set.add(idx)
-                current_sep = step_seps[j + 1]
+                sep = step_seps[j + 1]
 
                 _voronoi_step_dist(
-                    state,
-                    hausdorff,
-                    voronoi,
-                    X_sel,
-                    norms_sel,
-                    idx,
-                    sel_pos,
-                    full_threshold,
+                    state, hausdorff, voronoi, X_sel, norms_sel,
+                    idx, sel_pos, full_threshold,
                 )
 
-            points_needed -= best_m
+            budget -= best_m
 
-        # Fill remainder with unrestricted FPS (voronoi-accelerated)
-        while points_needed > 0:
+        # fill remainder with unrestricted FPS over the global matrix.
+        while budget > 0:
             best_idx = int(torch.argmax(hausdorff).item())
             best_val = float(hausdorff[best_idx].item())
 
-            current_sep = min(current_sep, best_val)
-            sel_pos = len(current_sel)
-            current_sel.append(best_idx)
+            sep = min(sep, best_val)
+            sel_pos = len(selected)
+            selected.append(best_idx)
             selected_set.add(best_idx)
 
             _voronoi_step_dist(
-                state,
-                hausdorff,
-                voronoi,
-                X_sel,
-                norms_sel,
-                best_idx,
-                sel_pos,
-                full_threshold,
+                state, hausdorff, voronoi, X_sel, norms_sel,
+                best_idx, sel_pos, full_threshold,
             )
-            points_needed -= 1
+            budget -= 1
 
-        # End-of-level Gonzalez invariant. hausdorff is replicated → no NCCL.
+        # end-of-level Gonzalez invariant. hausdorff is replicated => no NCCL needed
         GROSS_VIOLATION_REL = 1e-3
         cov_sq = max(0.0, float(hausdorff.max().item()))
-        sep_sq = current_sep
+        sep_sq = sep
         sep_val = math.sqrt(max(sep_sq, 0.0)) if math.isfinite(sep_sq) else float("inf")
         cov_val = math.sqrt(cov_sq)
         rel_gap = (
@@ -452,7 +431,7 @@ def accrete(
             )
 
         if verbose and rank == 0:
-            sel_set = set(current_sel[:target_size])
+            sel_set = set(selected[:target_size])
             in_bk = len(sel_set & nested_blocks[k - 1])
             from_a = sum(1 for s in sel_set if s < n_anchor)
             rel_gap_str = f"{rel_gap:>11.3e}" if math.isfinite(rel_gap) else f"{'inf':>11}"
@@ -462,4 +441,4 @@ def accrete(
                 f"{sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str}"
             )
 
-    return torch.tensor(current_sel, dtype=torch.long, device=device)
+    return torch.tensor(selected, dtype=torch.long, device=device)
