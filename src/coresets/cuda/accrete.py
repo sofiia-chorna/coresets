@@ -85,6 +85,14 @@ def accrete(
     norms_sel = torch.empty(max_sel, dtype=torch.float32, device=X.device)
     scratch = Scratch.alloc(max_sel, dim, X.dtype, X.device, ext.MAX_ARGMAX_BLOCKS)
 
+    # persistent snapshot buffers: pre-block (h/v_snap) and post-forward (h/v_final).
+    # reused via copy_() each block - avoids reallocating four (n_total,) tensors per
+    # bisect cycle
+    h_snap = torch.empty_like(hausdorff)
+    v_snap = torch.empty_like(voronoi)
+    h_final = torch.empty_like(hausdorff)
+    v_final = torch.empty_like(voronoi)
+
     trace = Tracer(trace_path)
     profiler = PhaseTimer(enabled=profile, on_cuda=X.is_cuda)
 
@@ -123,8 +131,8 @@ def accrete(
 
             # snapshot pre-block state - rolled back after the bisect picks best_m.
             with profiler("snapshot_s"):
-                h_snap = hausdorff.clone()
-                v_snap = voronoi.clone()
+                h_snap.copy_(hausdorff)
+                v_snap.copy_(voronoi)
                 sep_snap = sep
                 n_snap = len(selected)
                 sel_snap = list(selected)
@@ -140,12 +148,16 @@ def accrete(
 
             # bisect: largest m for which keeping ``added[:m]`` still admits
             # a viable FPS completion (sep > cov throughout).
-            h_final = hausdorff.clone()
-            v_final = voronoi.clone()
+            h_final.copy_(hausdorff)
+            v_final.copy_(voronoi)
+            # build sel_start / added as device tensors once per block - they're
+            # sliced (not realloc'd) inside the bisect+reconstruct loop
+            sel_snap_t = torch.tensor(sel_snap, dtype=torch.long, device=X.device)
+            added_t = torch.tensor(added, dtype=torch.long, device=X.device)
             with profiler("bisect_s"):
                 best_m = bisect_voronoi_fast(
                     X, norms, h_snap, h_final, v_final, v_snap,
-                    sel_snap, added, step_seps, budget, n_snap, scratch,
+                    sel_snap_t, added_t, step_seps, budget, n_snap, scratch,
                 )
 
             # rollback to snapshot, then replay only the best_m steps that survived bisect.

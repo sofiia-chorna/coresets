@@ -74,16 +74,20 @@ def reconstruct_hausdorff_with_voronoi(
     h_final: Tensor,
     v_final: Tensor,
     v_snap: Tensor,
-    added: List[int],
+    sel_start_t: Tensor,
+    added_t: Tensor,
     m: int,
     n_snap: int,
-    sel_start: List[int],
 ) -> Tuple[Tensor, Tensor]:
     """Rebuild ``(h_mid, voronoi_mid)`` for prefix ``sel_start + added[:m]``.
 
     Affected points (those whose nearest center in the full forward run came
     from ``added[m:]``) are recomputed against ``added[:m]`` only; everyone
     else's ``v_final`` assignment is already valid.
+
+    ``sel_start_t`` and ``added_t`` are device int64 tensors. Slicing
+    ``added_t[:m]`` replaces the per-call ``torch.tensor(...)`` host->device
+    transfer the previous interface required.
     """
     device = X.device
 
@@ -100,8 +104,8 @@ def reconstruct_hausdorff_with_voronoi(
             h_mid[affected_idx] = h_snap[affected_idx]
             voronoi_mid[affected_idx] = v_snap[affected_idx]
         else:
-            added_t = torch.tensor(added[:m], dtype=torch.long, device=device)
-            X_added, norms_added = X[added_t], norms[added_t]
+            added_slice = added_t[:m]
+            X_added, norms_added = X[added_slice], norms[added_slice]
             X_affected, norms_affected = X[affected_idx], norms[affected_idx]
             n_affected = affected_idx.numel()
 
@@ -125,11 +129,9 @@ def reconstruct_hausdorff_with_voronoi(
                 chunk_vals, chunk_rel = d_chunk.min(dim=1)
                 improve = chunk_vals < min_to_added
                 min_to_added = torch.where(improve, chunk_vals, min_to_added)
-                argmin_to_added = torch.where(
-                    improve,
-                    torch.tensor(start, device=device) + chunk_rel,
-                    argmin_to_added,
-                )
+                # scalar-add via Python int avoids the per-iter
+                # torch.tensor(start, device=device) allocation
+                argmin_to_added = torch.where(improve, chunk_rel + start, argmin_to_added)
 
             # pick whichever is closer: snapshot's center or one of added[:m].
             snap_vals = h_snap[affected_idx]
@@ -142,9 +144,14 @@ def reconstruct_hausdorff_with_voronoi(
             )
 
     # mark prefix points as already-selected.
-    sel_prefix = sel_start + added[:m]
-    if sel_prefix:
-        sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=device)
+    n_sel_start = int(sel_start_t.shape[0])
+    if n_sel_start + m > 0:
+        if m == 0:
+            sel_t = sel_start_t
+        elif n_sel_start == 0:
+            sel_t = added_t[:m]
+        else:
+            sel_t = torch.cat((sel_start_t, added_t[:m]))
         h_mid[sel_t] = -1.0
 
     return h_mid, voronoi_mid
