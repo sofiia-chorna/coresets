@@ -119,6 +119,13 @@ class MultiGPUAccrete(ABC):
         self.X_sel = torch.empty((max_sel, dim), dtype=x_dtype, device=device)
         self.norms_sel = torch.empty(max_sel, dtype=torch.float32, device=device)
 
+        # persistent snapshot/final shard buffers reused via copy_() each block -
+        # avoids reallocating four (N_shard,) tensors per bisect cycle.
+        self.h_snap = torch.empty_like(self.hausdorff_shard)
+        self.v_snap = torch.empty_like(self.voronoi_shard)
+        self.h_final = torch.empty_like(self.hausdorff_shard)
+        self.v_final = torch.empty_like(self.voronoi_shard)
+
         self.anchor_indices: List[int] = idx_A.tolist()
         self.nested_blocks: List[Set[int]] = [
             set(self.anchor_indices[: min(2**i, n_anchor_global)]) for i in range(1, max_k + 1)
@@ -229,11 +236,17 @@ class MultiGPUAccrete(ABC):
         if not added:
             return budget
 
-        h_final = self.hausdorff_shard.clone()
-        v_final = self.voronoi_shard.clone()
+        self.h_final.copy_(self.hausdorff_shard)
+        self.v_final.copy_(self.voronoi_shard)
+        # build sel_start / added as device tensors once per block - they're
+        # sliced (not realloc'd) inside the bisect+reconstruct loop.
+        sel_snap_t = torch.tensor(snap.selected, dtype=torch.long, device=self.device)
+        added_t = torch.tensor(added, dtype=torch.long, device=self.device)
 
         with self.profiler("bisect_s"):
-            best_m = self._bisect(snap, h_final, v_final, added, step_seps, budget)
+            best_m = self._bisect(
+                snap, self.h_final, self.v_final, added, added_t, sel_snap_t, step_seps, budget
+            )
 
         # rollback then replay best_m steps.
         self.hausdorff_shard.copy_(snap.hausdorff)
@@ -268,9 +281,13 @@ class MultiGPUAccrete(ABC):
         return True
 
     def _snapshot(self) -> _LayerSnapshot:
+        # only one snapshot is alive per _do_block, so sharing the persistent
+        # buffers is safe.
+        self.h_snap.copy_(self.hausdorff_shard)
+        self.v_snap.copy_(self.voronoi_shard)
         return _LayerSnapshot(
-            hausdorff=self.hausdorff_shard.clone(),
-            voronoi=self.voronoi_shard.clone(),
+            hausdorff=self.h_snap,
+            voronoi=self.v_snap,
             sep=self.sep,
             n_selected=len(self.selected),
             selected=list(self.selected),
@@ -282,19 +299,27 @@ class MultiGPUAccrete(ABC):
         h_final: Tensor,
         v_final: Tensor,
         added: List[int],
+        added_t: Tensor,
+        sel_start_t: Tensor,
         step_seps: List[float],
         total_budget: int,
     ) -> int:
-        """Binary-search the maximum viable prefix length of ``added``."""
+        """Binary-search the maximum viable prefix length of ``added``.
+
+        ``added_t`` and ``sel_start_t`` are device int64 tensors built once
+        per block by the caller and sliced on every iter, replacing the
+        per-iter ``torch.tensor(...)`` allocations.
+        """
         sim_X_sel = self.scratch.sim_X_sel
         sim_norms_sel = self.scratch.sim_norms_sel
-        low, high, best = 0, len(added), 0
+        n_added = int(added_t.shape[0])
+        low, high, best = 0, n_added, 0
 
         while low <= high:
             mid = (low + high) // 2
             sep_mid = step_seps[mid]
             points_left = total_budget - mid
-            final_size = len(snap.selected) + mid + points_left
+            final_size = snap.n_selected + mid + points_left
 
             if final_size >= self.layout.N_global:
                 best, low = mid, mid + 1
@@ -309,10 +334,10 @@ class MultiGPUAccrete(ABC):
                 self.norms_sel,
                 self.x_shard_view,
                 self.norms_shard_view,
-                added,
+                sel_start_t,
+                added_t,
                 mid,
                 snap.n_selected,
-                snap.selected,
                 self.layout.shard_offset,
                 self.layout.N_shard,
             )

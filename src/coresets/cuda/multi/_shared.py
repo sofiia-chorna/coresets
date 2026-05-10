@@ -103,10 +103,10 @@ def reconstruct_hausdorff_with_voronoi_multi(
     norms_sel: Tensor,
     X_shard: Tensor,
     norms_shard: Tensor,
-    added: List[int],
+    sel_start_t: Tensor,
+    added_t: Tensor,
     m: int,
     n_snap: int,
-    sel_start: List[int],
     shard_offset: int,
     N_shard: int,
 ) -> Tuple[Tensor, Tensor]:
@@ -124,10 +124,13 @@ def reconstruct_hausdorff_with_voronoi_multi(
             (the centers that ``added[:m]`` references) is read.
         X_shard, norms_shard: this rank's local feature slice (indexed by
             local row id).
-        added: global indices selected during the forward pass, in order.
+        sel_start_t: device int64 tensor of pre-snapshot selected indices
+            (so we can mask them out). Built once per block by the caller.
+        added_t: device int64 tensor of global indices selected during the
+            forward pass, in order. Sliced ``added_t[:m]`` instead of being
+            rebuilt on every bisect iteration.
         m: bisect midpoint — the prefix length we're rebuilding state for.
         n_snap: number of selected centers at snapshot time.
-        sel_start: pre-snapshot selected indices (so we can mask them out).
         shard_offset, N_shard: this rank's slice geometry.
 
     Returns ``(h_mid, voronoi_mid)`` — local shard tensors at prefix
@@ -170,11 +173,9 @@ def reconstruct_hausdorff_with_voronoi_multi(
                 chunk_vals, chunk_rel = d_chunk.min(dim=1)
                 improve = chunk_vals < min_to_added
                 min_to_added = torch.where(improve, chunk_vals, min_to_added)
-                argmin_to_added = torch.where(
-                    improve,
-                    torch.tensor(start, device=device, dtype=torch.long) + chunk_rel,
-                    argmin_to_added,
-                )
+                # scalar-add via Python int avoids the per-iter
+                # torch.tensor(start, device=device) allocation
+                argmin_to_added = torch.where(improve, chunk_rel + start, argmin_to_added)
 
             snap_vals = h_snap_shard[affected_idx]
             snap_closer = snap_vals <= min_to_added
@@ -186,9 +187,14 @@ def reconstruct_hausdorff_with_voronoi_multi(
             )
 
     # mark this shard's prefix points as already-selected.
-    sel_prefix = sel_start + added[:m]
-    if sel_prefix:
-        sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=device)
+    n_sel_start = int(sel_start_t.shape[0])
+    if n_sel_start + m > 0:
+        if m == 0:
+            sel_t = sel_start_t
+        elif n_sel_start == 0:
+            sel_t = added_t[:m]
+        else:
+            sel_t = torch.cat((sel_start_t, added_t[:m]))
         local_mask = (sel_t >= shard_offset) & (sel_t < shard_offset + N_shard)
         local_sel = sel_t[local_mask] - shard_offset
         if local_sel.numel() > 0:

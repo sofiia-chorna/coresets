@@ -57,6 +57,7 @@ PATCH_FILES=(
     src/coresets/cuda/accrete.py
     src/coresets/cuda/_internal/bisect.py
     src/coresets/cuda/_internal/reconstruct.py
+    src/coresets/cuda/_internal/diag.py
 )
 
 cd "$REPO"
@@ -64,7 +65,7 @@ cd "$REPO"
 # Sanity: stash will only succeed if at least one of the patch files is dirty.
 DIRTY=0
 for f in "${PATCH_FILES[@]}"; do
-    if ! git diff --quiet -- "$f"; then DIRTY=1; fi
+    if ! git diff --quiet HEAD -- "$f"; then DIRTY=1; fi
 done
 if [ "$DIRTY" -eq 0 ]; then
     echo "FAIL: none of the patch files are dirty - nothing to compare against."
@@ -124,6 +125,5 @@ ok_b = cmp("$PRE_B", "$POST_B", "Config B (N=$CFG_B_N,D=$CFG_B_D,K=$CFG_B_K)")
 sys.exit(0 if (ok_a and ok_b) else 1)
 PYEOF
 
-# cleanup
 rm -f "$POST_A" "$PRE_A" "$POST_B" "$PRE_B"
 echo "ENDING $(date)"

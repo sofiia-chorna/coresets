@@ -92,7 +92,7 @@ def run_single(args):
 
 
 def run_multi(args):
-    from coresets._cuda_multi import accrete_voronoi_multi
+    from coresets.cuda.multi import accrete_voronoi_multi
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -151,7 +151,7 @@ def run_multi(args):
 
 
 def run_sharded(args):
-    from coresets._cuda_multi import (
+    from coresets.cuda.multi import (
         accrete_voronoi_multi_sharded,
         compute_shard_layout,
     )

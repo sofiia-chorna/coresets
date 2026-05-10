@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 
 from coresets import warmup_fast_fps  # noqa: E402
-from coresets._cuda_multi import accrete_voronoi_multi  # noqa: E402
+from coresets.cuda.multi import accrete_voronoi_multi  # noqa: E402
 
 
 def _env_int(name: str, default: int) -> int:

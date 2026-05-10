@@ -1,0 +1,233 @@
++ ulimit -c 0
++ export CUDA_CACHE_DISABLE=1
++ CUDA_CACHE_DISABLE=1
++ export TRITON_HOME=/dev/shm/
++ TRITON_HOME=/dev/shm/
++ export OMP_NUM_THREADS=14
++ OMP_NUM_THREADS=14
++ export MPICH_GPU_SUPPORT_ENABLED=0
++ MPICH_GPU_SUPPORT_ENABLED=0
++ export TORCH_CUDA_ARCH_LIST=9.0
++ TORCH_CUDA_ARCH_LIST=9.0
++ export NCCL_DEBUG=WARN
++ NCCL_DEBUG=WARN
++ export TORCH_EXTENSIONS_DIR=/dev/shm/torch_ext_3389042
++ TORCH_EXTENSIONS_DIR=/dev/shm/torch_ext_3389042
++ REPO=/capstor/scratch/cscs/schorna/merge-datasets/coresets
++ REF_FILE=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042.npy
++ REF_FILE_2=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_b.npy
++ TRACE_SINGLE=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv
++ TRACE_MULTI=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_multi_3389042.tsv
++ TRACE_SHARD=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042.tsv
++ REF_FILE_B=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_cfgB.npy
++ TRACE_SINGLE_B=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042_cfgB.tsv
++ TRACE_SHARD_B=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042_cfgB.tsv
++ CFG_B_N=16383
++ CFG_B_D=128
++ CFG_B_K=8192
+++ scontrol show hostnames nid006544
+++ head -n 1
++ export MASTER_ADDR=nid006544
++ MASTER_ADDR=nid006544
++ export MASTER_PORT=29501
++ MASTER_PORT=29501
+++ date
++ echo 'STARTING Sun May 10 09:54:46 PM CEST 2026'
+STARTING Sun May 10 09:54:46 PM CEST 2026
++ echo '=== Phase 1a: single-GPU run #1 ==='
+=== Phase 1a: single-GPU run #1 ===
++ srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    python3 tests/test_determinism.py --mode single --out /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042.npy --trace /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv
+'
+0: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+0: Compilation finished. Kernel loaded.
+0: [single] wrote /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042.npy shape=(2048,) dtype=int64
+0: [single] first 10: [ 0  8  2 15  4  6  5 13 10  7]
+0: [single] last  10: [6877 6049 5248 2709 3628 7557 6000 3952 6312 4092]
++ echo '=== Phase 1b: single-GPU run #2 (re-run stability) ==='
+=== Phase 1b: single-GPU run #2 (re-run stability) ===
++ srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    python3 tests/test_determinism.py --mode single --out /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_b.npy
+'
+0: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+0: Compilation finished. Kernel loaded.
+0: [single] wrote /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_b.npy shape=(2048,) dtype=int64
+0: [single] first 10: [ 0  8  2 15  4  6  5 13 10  7]
+0: [single] last  10: [6877 6049 5248 2709 3628 7557 6000 3952 6312 4092]
++ python3 -
+OK re-run: byte-identical across two single-GPU runs (2,048 indices).
++ set +e
++ echo '=== Phase 2: multi-GPU replicated-X (world_size=4) vs single-GPU reference ==='
+=== Phase 2: multi-GPU replicated-X (world_size=4) vs single-GPU reference ===
++ srun -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    export RANK=$SLURM_PROCID
+    export WORLD_SIZE=$SLURM_NTASKS
+    export LOCAL_RANK=$SLURM_LOCALID
+    python3 tests/test_determinism.py --mode multi --ref /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042.npy --trace /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_multi_3389042.tsv
+'
+3: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+1: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+2: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+0: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+3: Compilation finished. Kernel loaded.
+1: Compilation finished. Kernel loaded.
+2: Compilation finished. Kernel loaded.
+0: Compilation finished. Kernel loaded.
+0: /user-environment/env/default/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+0:   warnings.warn(  # warn only once
+0: [rank0]:[W510 21:56:06.402787079 ProcessGroupNCCL.cpp:5072] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+0: NCCL version 2.29.2+cuda12.9
+3: 
+3: [2026-05-10 21:56:07] nid006544:242255:242255 [3] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+2: 
+2: [2026-05-10 21:56:07] nid006544:242254:242254 [2] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+1: 
+1: [2026-05-10 21:56:07] nid006544:242253:242253 [1] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+0: 
+0: [2026-05-10 21:56:07] nid006544:242252:242252 [0] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+0: [multi ] shape=(2048,) dtype=int64  world_size=4
+0: OK: byte-identical to reference (2,048 indices match).
++ MULTI_EXIT=0
++ echo '=== Trace diff (multi): first 10 differing lines (single | multi) ==='
+=== Trace diff (multi): first 10 differing lines (single | multi) ===
++ '[' -f /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv ']'
++ '[' -f /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_multi_3389042.tsv ']'
++ diff -u /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_multi_3389042.tsv
++ head -40
++ echo '--- line counts ---'
+--- line counts ---
++ wc -l /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_multi_3389042.tsv
+  5739 /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv
+  5739 /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_multi_3389042.tsv
+ 11478 total
++ echo '=== Phase 3: multi-GPU sharded-X (world_size=4) vs single-GPU reference ==='
+=== Phase 3: multi-GPU sharded-X (world_size=4) vs single-GPU reference ===
++ srun -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    export RANK=$SLURM_PROCID
+    export WORLD_SIZE=$SLURM_NTASKS
+    export LOCAL_RANK=$SLURM_LOCALID
+    python3 tests/test_determinism.py --mode sharded --ref /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042.npy --trace /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042.tsv
+'
+1: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+2: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+3: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+0: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+1: Compilation finished. Kernel loaded.
+2: Compilation finished. Kernel loaded.
+3: Compilation finished. Kernel loaded.
+0: Compilation finished. Kernel loaded.
+0: /user-environment/env/default/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+0:   warnings.warn(  # warn only once
+0: [rank0]:[W510 21:56:21.318416602 ProcessGroupNCCL.cpp:5072] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+0: NCCL version 2.29.2+cuda12.9
+0: 
+0: [2026-05-10 21:56:21] nid006544:242963:242963 [0] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+3: 
+3: [2026-05-10 21:56:21] nid006544:242966:242966 [3] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+2: 
+2: [2026-05-10 21:56:21] nid006544:242965:242965 [2] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+1: 
+1: [2026-05-10 21:56:22] nid006544:242964:242964 [1] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+0: [sharded] shape=(2048,) dtype=int64  world_size=4
+0: OK: sharded byte-identical to reference (2,048 indices match).
++ SHARD_EXIT=0
++ set -e
++ echo '=== Trace diff (sharded): first 10 differing lines (single | sharded) ==='
+=== Trace diff (sharded): first 10 differing lines (single | sharded) ===
++ '[' -f /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv ']'
++ '[' -f /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042.tsv ']'
++ diff -u /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042.tsv
++ head -40
++ echo '--- line counts ---'
+--- line counts ---
++ wc -l /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042.tsv
+  5739 /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042.tsv
+  5739 /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042.tsv
+ 11478 total
++ set +e
++ echo '=== Phase 4a: Config B single-GPU reference (N=16383, D=128, K=8192) ==='
+=== Phase 4a: Config B single-GPU reference (N=16383, D=128, K=8192) ===
++ srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    python3 tests/test_determinism.py --mode single \
+        --N 16383 --D 128 --K 8192 \
+        --out /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_cfgB.npy --trace /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042_cfgB.tsv
+'
+0: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+0: Compilation finished. Kernel loaded.
+0: [single] wrote /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_cfgB.npy shape=(8192,) dtype=int64
+0: [single] first 10: [   0   12    8   54   49   92   76 9940   14   11]
+0: [single] last  10: [13062 16241 14654 10850 11918 15617  9478  8490  9643 10166]
++ CFG_B_SINGLE_EXIT=0
++ echo '=== Phase 4b: Config B sharded-X (world_size=4) vs Config B reference ==='
+=== Phase 4b: Config B sharded-X (world_size=4) vs Config B reference ===
++ srun -ul bash -c '
+    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+    export PYTHONPATH=/capstor/scratch/cscs/schorna/merge-datasets/coresets/src:${PYTHONPATH:-}
+    cd /capstor/scratch/cscs/schorna/merge-datasets/coresets
+    export RANK=$SLURM_PROCID
+    export WORLD_SIZE=$SLURM_NTASKS
+    export LOCAL_RANK=$SLURM_LOCALID
+    python3 tests/test_determinism.py --mode sharded \
+        --N 16383 --D 128 --K 8192 \
+        --ref /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_cfgB.npy --trace /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042_cfgB.tsv
+'
+3: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+2: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+3: Compilation finished. Kernel loaded.
+1: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+0: Compiling custom CUDA FPS kernels... (first time, ~15 s)
+1: Compilation finished. Kernel loaded.
+2: Compilation finished. Kernel loaded.
+0: Compilation finished. Kernel loaded.
+0: /user-environment/env/default/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+0:   warnings.warn(  # warn only once
+0: [rank0]:[W510 21:56:47.556663966 ProcessGroupNCCL.cpp:5072] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+0: NCCL version 2.29.2+cuda12.9
+0: 
+0: [2026-05-10 21:56:48] nid006544:244450:244450 [0] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+3: 
+3: [2026-05-10 21:56:48] nid006544:244453:244453 [3] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+2: 
+2: [2026-05-10 21:56:48] nid006544:244452:244452 [2] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+1: 
+1: [2026-05-10 21:56:48] nid006544:244451:244451 [1] ncclResult_t nccl_ofi_gin_init(void**, uint64_t, ncclDebugLogger_t):23 NCCL WARN NET/OFI GIN only supports RDMA transport protocol.
+0: [sharded] shape=(8192,) dtype=int64  world_size=4
+0: OK: sharded byte-identical to reference (8,192 indices match).
++ CFG_B_SHARD_EXIT=0
++ set -e
++ echo '=== Config B trace diff: first 10 differing lines (single | sharded) ==='
+=== Config B trace diff: first 10 differing lines (single | sharded) ===
++ '[' -f /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042_cfgB.tsv ']'
++ '[' -f /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042_cfgB.tsv ']'
++ diff -u /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042_cfgB.tsv /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042_cfgB.tsv
++ head -40
++ echo '--- line counts ---'
+--- line counts ---
++ wc -l /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042_cfgB.tsv /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042_cfgB.tsv
+  22570 /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_single_3389042_cfgB.tsv
+  22570 /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/trace_shard_3389042_cfgB.tsv
+  45140 total
++ rm -f /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042.npy /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_b.npy /capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/ref_indices_3389042_cfgB.npy
+++ date
++ echo 'ENDING Sun May 10 09:57:07 PM CEST 2026'
+ENDING Sun May 10 09:57:07 PM CEST 2026
++ '[' 0 -ne 0 ']'
++ '[' 0 -ne 0 ']'
++ '[' 0 -ne 0 ']'
++ '[' 0 -ne 0 ']'
++ exit 0
