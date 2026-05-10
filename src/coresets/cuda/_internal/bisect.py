@@ -19,26 +19,33 @@ def bisect_voronoi_fast(
     h_final: Tensor,
     v_final: Tensor,
     v_snap: Tensor,
-    sel_start: List[int],
-    added: List[int],
+    sel_start_t: Tensor,
+    added_t: Tensor,
     step_seps: List[float],
     total_budget: int,
     n_snap: int,
     scratch: Scratch,
 ) -> int:
-    """Binary-search the maximum viable prefix length of ``added``."""
+    """Binary-search the maximum viable prefix length of ``added``.
+
+    ``sel_start_t`` and ``added_t`` are device int64 tensors. They're built once
+    per block by the caller and sliced on every iter, replacing the previous
+    per-iter ``torch.tensor(...)`` allocations.
+    """
     ensure_compiled()
     ext = get_ext()
 
     N = X.shape[0]
+    n_added = int(added_t.shape[0])
+    n_sel_start = int(sel_start_t.shape[0])
 
-    low, high, best = 0, len(added), 0
+    low, high, best = 0, n_added, 0
 
     while low <= high:
         mid = (low + high) // 2
         sep_mid = step_seps[mid]
         points_left = total_budget - mid
-        final_size = len(sel_start) + mid + points_left
+        final_size = n_sel_start + mid + points_left
 
         # asking for more rows than exist -> trivially viable.
         if final_size >= N:
@@ -48,7 +55,7 @@ def bisect_voronoi_fast(
         # rebuild (h_mid, voronoi_mid) at this prefix length without re-running FPS.
         h_mid, voronoi_mid = reconstruct_hausdorff_with_voronoi(
             X, norms, h_snap, h_final, v_final, v_snap,
-            added, mid, n_snap, sel_start,
+            sel_start_t, added_t, mid, n_snap,
         )
 
         # kthvalue early-exit - viable iff sep_mid beats the (n_pos - points_left)-th
@@ -74,9 +81,13 @@ def bisect_voronoi_fast(
             continue
 
         # build initial-prefix tensors for the C++ sim (rows the sim shouldn't re-pick).
-        sel_prefix = sel_start + added[:mid]
-        if sel_prefix:
-            sel_t = torch.tensor(sel_prefix, dtype=torch.long, device=X.device)
+        if n_sel_start + mid > 0:
+            if mid == 0:
+                sel_t = sel_start_t
+            elif n_sel_start == 0:
+                sel_t = added_t[:mid]
+            else:
+                sel_t = torch.cat((sel_start_t, added_t[:mid]))
             X_sel_init, norms_sel_init = X[sel_t], norms[sel_t]
         else:
             X_sel_init = torch.empty((0, X.shape[1]), dtype=X.dtype, device=X.device)

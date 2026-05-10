@@ -58,9 +58,8 @@ class PhaseTimer:
         """Build a profiler.
 
         Args:
-            enabled: ``False`` makes every ``with timer(...)`` a no-op (zero overhead).
-            on_cuda: ``True`` triggers ``cuda.synchronize`` at scope entry/exit so
-                the wall-clock numbers reflect actual GPU work, not launch latency.
+            enabled: ``False`` makes every ``with timer(...)`` a no-op.
+            on_cuda: ``True`` triggers ``cuda.synchronize`` at scope entry/exit.
         """
         self._enabled = enabled
         self._on_cuda = on_cuda
@@ -91,20 +90,22 @@ class _PhaseScope:
         self._t0 = 0.0
 
     def __enter__(self):
-        if self._parent._enabled:
+        if not self._parent._enabled:
+            return self
+        if self._parent._on_cuda:
             # sync before starting so prior async kernels don't bleed into this phase's time.
-            if self._parent._on_cuda:
-                torch.cuda.synchronize()
-            self._t0 = time.perf_counter()
+            torch.cuda.synchronize()
+        self._t0 = time.perf_counter()
         return self
 
     def __exit__(self, *exc):
-        if self._parent._enabled:
+        if not self._parent._enabled:
+            return
+        if self._parent._on_cuda:
             # sync at exit too - capture all GPU work this scope launched.
-            if self._parent._on_cuda:
-                torch.cuda.synchronize()
-            dt = time.perf_counter() - self._t0
-            self._parent._totals[self._phase] = self._parent._totals.get(self._phase, 0.0) + dt
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - self._t0
+        self._parent._totals[self._phase] = self._parent._totals.get(self._phase, 0.0) + dt
 
 
 # ----------------------------------------------------------- per-level invariant
