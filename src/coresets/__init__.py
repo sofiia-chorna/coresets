@@ -1,11 +1,12 @@
 """coresets — FPS-accretion coreset construction at scale.
 
-Public API (the blessed six):
+Public API:
 
-    accrete             — single-GPU coreset accretion (CUDA)
-    accrete_sharded     — multi-GPU sharded coreset accretion (CUDA)
+    accrete             — single-GPU coreset accretion (CUDA, K = 2^max_k)
+    accrete_sharded     — multi-GPU sharded coreset accretion (CUDA, K = 2^max_k)
     fps                 — torch-based FPS (anchors up to a few M points)
-    fps_cuda            — custom-kernel FPS (very large N)
+    fps_cuda            — custom-kernel single-GPU FPS (very large N, any K)
+    fps_sharded         — multi-GPU sharded plain FPS (any K, returns epsilons)
     compute_shard_layout — per-rank slice ranges for data loading
     warmup_fast_fps     — JIT-compile CUDA kernels before timing-sensitive code
 
@@ -34,7 +35,7 @@ See ``examples/run_minimal.py`` for a complete runnable script.
 """
 
 from .cuda import accrete, warmup_fast_fps
-from .cuda.multi import accrete_sharded, compute_shard_layout
+from .cuda.multi import accrete_sharded, compute_shard_layout, fps_sharded
 from .pytorch.fps import fps
 from .cuda.fps import fps as fps_cuda
 
@@ -43,6 +44,7 @@ __all__ = [
     "accrete_sharded",
     "fps",
     "fps_cuda",
+    "fps_sharded",
     "compute_shard_layout",
     "warmup_fast_fps",
 ]
