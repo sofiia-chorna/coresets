@@ -313,6 +313,24 @@ class MultiGPUAccrete(ABC):
         sim_X_sel = self.scratch.sim_X_sel
         sim_norms_sel = self.scratch.sim_norms_sel
         n_added = int(added_t.shape[0])
+
+        prefix_indices = torch.cat((sel_start_t, added_t))
+        in_shard = (prefix_indices >= self.layout.shard_offset) & (
+            prefix_indices < self.layout.shard_offset + self.layout.N_shard
+        )
+        cumsum_padded = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.long, device=self.device),
+                torch.cumsum(in_shard.long(), dim=0),
+            )
+        )
+        prefix_count_local = cumsum_padded[
+            snap.n_selected : snap.n_selected + n_added + 1
+        ]
+        n_pos_arr = self.layout.N_shard - prefix_count_local
+        dist.all_reduce(n_pos_arr, op=dist.ReduceOp.SUM)
+        n_pos_global_cpu = n_pos_arr.cpu().tolist()
+
         low, high, best = 0, n_added, 0
 
         while low <= high:
@@ -322,6 +340,12 @@ class MultiGPUAccrete(ABC):
             final_size = snap.n_selected + mid + points_left
 
             if final_size >= self.layout.N_global:
+                best, low = mid, mid + 1
+                continue
+
+            # Trivially-viable check: skip reconstruction entirely on this path.
+            n_pos_global = n_pos_global_cpu[mid]
+            if points_left >= n_pos_global:
                 best, low = mid, mid + 1
                 continue
 
@@ -341,16 +365,6 @@ class MultiGPUAccrete(ABC):
                 self.layout.shard_offset,
                 self.layout.N_shard,
             )
-
-            # global n_positive early-exit.
-            n_pos_local = int((h_mid >= 0).sum().item())
-            n_pos_t = torch.tensor([n_pos_local], dtype=torch.long, device=self.device)
-            dist.all_reduce(n_pos_t, op=dist.ReduceOp.SUM)
-            n_pos_global = int(n_pos_t.item())
-
-            if points_left >= n_pos_global:
-                best, low = mid, mid + 1
-                continue
 
             if points_left == 0:
                 max_h_global = self._global_max_h(h_mid)

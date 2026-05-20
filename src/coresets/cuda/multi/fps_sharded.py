@@ -55,6 +55,7 @@ def fps_sharded(
     seed: Optional[int] = None,
     checkpoint_path: Optional[str] = None,
     checkpoint_every: int = 0,
+    resume_from: Optional[str] = None,
     log_every: Optional[int] = None,
     verbose: bool = True,
 ) -> Tuple[Tensor, Tensor]:
@@ -76,11 +77,23 @@ def fps_sharded(
             row-major contiguous.
         n_to_select: K, in ``[1, N_global]``. **No power-of-2 restriction.**
         seed: optional global index for the first pick (default: row 0).
+            Ignored when ``resume_from`` is set (seed lives in checkpointed
+            ``selected[0]`` already).
         checkpoint_path: rank-0 atomic dumps of partial state to
             ``{path}_k{k:010d}_ids.npy`` and ``{path}_k{k:010d}_eps.npy``,
             with ``{path}_latest.txt`` updated last. ``None`` disables.
         checkpoint_every: rank-0 dump cadence in steps. ``0`` = log2-doubling
             (2, 4, 8, …, K). ``>0`` = every ``checkpoint_every`` steps.
+        resume_from: path prefix of a previous run's checkpoint (the same
+            string as ``checkpoint_path`` of that run). Reads
+            ``{prefix}_latest.txt`` to find ``k0`` (the last completed step),
+            loads ``selected[:k0+1]`` from disk, then rebuilds the per-rank
+            ``hausdorff_shard`` / ``voronoi_shard`` state via batched matrix
+            distance — much cheaper than sequential replay (~1 min for
+            k0=1M, vs ~2h of replay). The new ``n_to_select`` must be
+            ``> k0+1``. The caller must pass the **same** ``X_local`` data
+            and shard layout as the original run for the resume to be
+            byte-identical with a fresh K=n_to_select run.
         log_every: rank-0 progress print cadence. Default = ``max(1, K // 100)``.
         verbose: rank-0 status output. Errors are always raised on every rank.
 
@@ -274,30 +287,92 @@ def fps_sharded(
     if log_every is None:
         log_every = max(1, n_to_select // 100)
 
-    # ------------------------------------------------------------ seed
+    # ------------------------------------------------------------ seed OR resume
 
-    first = 0 if seed is None else int(seed)
-    if not 0 <= first < n_global:
-        raise ValueError(f"seed={first} must be in [0, N_global={n_global})")
+    if resume_from is not None:
+        k0_done, selected_prev_np = _load_resume(resume_from)
+        K_prev = k0_done + 1
 
-    selected[0] = first
-    owner = layout.owner_of(first)
-    pack_row_by_owner(first, owner)
-    voronoi_step(first, 0, owner, owner)
+        if K_prev > n_to_select:
+            raise ValueError(
+                f"resume checkpoint has K_prev={K_prev} picks but n_to_select={n_to_select}. "
+                "Increase n_to_select to extend beyond the checkpoint."
+            )
 
-    if verbose and rank == 0:
-        print(
-            f"fps_sharded: N_global={n_global:,}  D={dim}  K={n_to_select:,}  "
-            f"world_size={world_size}  host={socket.gethostname()}"
+        if K_prev == n_to_select:
+            if verbose and rank == 0:
+                print(f"fps_sharded: resume k0={K_prev:,} == n_to_select; no new picks to make")
+
+            selected[:K_prev] = torch.from_numpy(selected_prev_np).to(device=device, dtype=torch.long)
+
+            eps_file = f"{resume_from}_k{k0_done:010d}_eps.npy"
+            if os.path.exists(eps_file):
+                eps_loaded = np.load(eps_file).astype(np.float32, copy=False)
+                epsilons_np[: eps_loaded.shape[0]] = eps_loaded
+            return selected, torch.from_numpy(epsilons_np)
+
+        if verbose and rank == 0:
+            print(
+                f"fps_sharded: resume from {resume_from}  K_prev={K_prev:,}  "
+                f"new target K={n_to_select:,}  N_global={n_global:,}  D={dim}  "
+                f"world_size={world_size}  host={socket.gethostname()}"
+            )
+
+        t_resume = time.time()
+        _rebuild_state_from_selected(
+            selected_prev_np=selected_prev_np,
+            selected=selected,
+            X_local=X_local,
+            norms_local=norms_local,
+            X_sel=X_sel,
+            norms_sel=norms_sel,
+            hausdorff_shard=hausdorff_shard,
+            voronoi_shard=voronoi_shard,
+            layout=layout,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            verbose=verbose and rank == 0,
         )
-        print(f"  shard sizes = {sizes}")
-        print(f"  seed = global row {first} (owner rank {owner})")
+
+        # restore the prior epsilons if present
+        eps_file = f"{resume_from}_k{k0_done:010d}_eps.npy"
+        if os.path.exists(eps_file):
+            eps_loaded = np.load(eps_file).astype(np.float32, copy=False)
+            epsilons_np[: eps_loaded.shape[0]] = eps_loaded
+        else:
+            # synthesize a placeholder so the array is well-defined
+            epsilons_np[0] = float("inf")
+
+        if verbose and rank == 0:
+            print(f"  resume state rebuilt in {time.time() - t_resume:.1f}s")
+
+        start_i = K_prev
+    else:
+        first = 0 if seed is None else int(seed)
+        if not 0 <= first < n_global:
+            raise ValueError(f"seed={first} must be in [0, N_global={n_global})")
+
+        selected[0] = first
+        owner = layout.owner_of(first)
+        pack_row_by_owner(first, owner)
+        voronoi_step(first, 0, owner, owner)
+
+        if verbose and rank == 0:
+            print(
+                f"fps_sharded: N_global={n_global:,}  D={dim}  K={n_to_select:,}  "
+                f"world_size={world_size}  host={socket.gethostname()}"
+            )
+            print(f"  shard sizes = {sizes}")
+            print(f"  seed = global row {first} (owner rank {owner})")
+
+        start_i = 1
 
     # ------------------------------------------------------------ main loop
 
     t0 = time.time()
 
-    for i in range(1, n_to_select):
+    for i in range(start_i, n_to_select):
         best_val, new_idx, winner = argmax_global()
         selected[i] = new_idx
         epsilons_np[i] = best_val
@@ -305,7 +380,8 @@ def fps_sharded(
 
         if verbose and rank == 0 and (i % log_every == 0 or i == n_to_select - 1):
             elapsed = time.time() - t0
-            rate = i / elapsed if elapsed > 0 else 0.0
+            picks_done = i - start_i + 1
+            rate = picks_done / elapsed if elapsed > 0 else 0.0
             eps_now = math.sqrt(max(best_val, 0.0))
             print(
                 f"  {i:>10,}/{n_to_select:,}  "
@@ -319,9 +395,10 @@ def fps_sharded(
         elapsed = time.time() - t0
         eps_final_sq = float(epsilons_np[-1])
         eps_final = math.sqrt(max(eps_final_sq, 0.0))
-        rate = n_to_select / elapsed if elapsed > 0 else 0.0
+        picks_done = n_to_select - start_i
+        rate = picks_done / elapsed if elapsed > 0 else 0.0
         print(
-            f"fps_sharded: done. K={n_to_select:,} in {elapsed:.1f}s "
+            f"fps_sharded: done. K={n_to_select:,} (+{picks_done:,} new) in {elapsed:.1f}s "
             f"({rate:.1f} pick/s)  eps_final={eps_final:.6e}  "
             f"eps_final_sq={eps_final_sq:.6e}"
         )
@@ -361,3 +438,113 @@ def _write_checkpoint(
     with open(tmp, "w") as f:
         f.write(f"{k}\n")
     os.replace(tmp, latest)
+
+
+# --------------------------------------------------------------- resume
+
+
+def _load_resume(path_prefix: str) -> Tuple[int, np.ndarray]:
+    latest_path = f"{path_prefix}_latest.txt"
+    if not os.path.exists(latest_path):
+        raise FileNotFoundError(
+            f"resume requires {latest_path}; not found. "
+            f"Either disable resume or point at a different prefix."
+        )
+
+    with open(latest_path) as f:
+        k_last = int(f.read().strip())
+
+    ids_path = f"{path_prefix}_k{k_last:010d}_ids.npy"
+    if not os.path.exists(ids_path):
+        raise FileNotFoundError(f"resume ids file missing: {ids_path}")
+
+    selected_prev = np.load(ids_path).astype(np.int64, copy=False)
+    if selected_prev.shape[0] != k_last + 1:
+        raise ValueError(
+            f"resume {ids_path} has {selected_prev.shape[0]} entries, "
+            f"expected k_last+1 = {k_last + 1}"
+        )
+
+    return k_last, selected_prev
+
+
+def _rebuild_state_from_selected(
+    *,
+    selected_prev_np: np.ndarray,
+    selected: Tensor,
+    X_local: Tensor,
+    norms_local: Tensor,
+    X_sel: Tensor,
+    norms_sel: Tensor,
+    hausdorff_shard: Tensor,
+    voronoi_shard: Tensor,
+    layout,
+    rank: int,
+    world_size: int,
+    device,
+    verbose: bool = True,
+) -> None:
+    """Rebuild per-rank FPS state (X_sel, norms_sel, hausdorff_shard, voronoi_shard)
+    from the loaded ``selected_prev_np`` indices via batched matrix distance.
+
+    All operations are done in float32 for accuracy regardless of X_local dtype.
+    """
+    K_prev = int(selected_prev_np.shape[0])
+    dim = int(X_local.shape[1])
+    n_local = int(X_local.shape[0])
+
+    selected_prev = torch.from_numpy(selected_prev_np).to(device=device, dtype=torch.long)
+    selected[:K_prev] = selected_prev
+
+    # ---- 1. Reconstruct X_sel and norms_sel via all-reduce-sum ----
+    X_sel_f32 = torch.zeros((K_prev, dim), dtype=torch.float32, device=device)
+    norms_sel_f32 = torch.zeros(K_prev, dtype=torch.float32, device=device)
+
+    # owner mask: which picks are mine?
+    owners = np.array(
+        [layout.owner_of(int(g)) for g in selected_prev_np], dtype=np.int64
+    )
+    mine = np.where(owners == rank)[0]
+    if mine.size > 0:
+        local_ix = torch.tensor(
+            [layout.to_local(int(selected_prev_np[j])) for j in mine],
+            dtype=torch.long, device=device,
+        )
+        # write rows in bulk
+        X_sel_f32[torch.from_numpy(mine).to(device)] = X_local[local_ix].to(torch.float32)
+        norms_sel_f32[torch.from_numpy(mine).to(device)] = norms_local[local_ix]
+
+    dist.all_reduce(X_sel_f32, op=dist.ReduceOp.SUM)
+    dist.all_reduce(norms_sel_f32, op=dist.ReduceOp.SUM)
+
+    X_sel[:K_prev] = X_sel_f32.to(X_sel.dtype)
+    norms_sel[:K_prev] = norms_sel_f32
+
+    # ---- 2. Recompute hausdorff_shard + voronoi_shard in chunks ----
+    bytes_budget = 6 * 1024 ** 3  # 6 GiB per distance tile
+    CHUNK = max(16, min(1024, bytes_budget // max(n_local * 4, 1)))
+    hausdorff_shard.fill_(float("inf"))
+    voronoi_shard.zero_()
+
+    if n_local > 0:
+        X_local_f32 = X_local.to(torch.float32)
+        norms_local_col = norms_local.unsqueeze(1)  # (N_local, 1)
+
+        for c0 in range(0, K_prev, CHUNK):
+            c1 = min(c0 + CHUNK, K_prev)
+            X_chunk = X_sel_f32[c0:c1]                          # (chunk, D)
+            n_chunk = norms_sel_f32[c0:c1].unsqueeze(0)         # (1, chunk)
+            dots = X_local_f32 @ X_chunk.T                      # (N_local, chunk)
+            dists = norms_local_col + n_chunk - 2.0 * dots
+            chunk_min, chunk_argmin = dists.min(dim=1)
+            better = chunk_min < hausdorff_shard
+            hausdorff_shard.copy_(torch.where(better, chunk_min, hausdorff_shard))
+            voronoi_shard.copy_(
+                torch.where(better, (chunk_argmin + c0).to(torch.long), voronoi_shard)
+            )
+            if verbose and (c1 % (CHUNK * 16) == 0 or c1 == K_prev):
+                print(f"  rebuild chunk {c1:,}/{K_prev:,}", flush=True)
+
+        # Mark selected-from-this-rank rows as -1 so they're never re-picked
+        if mine.size > 0:
+            hausdorff_shard[local_ix] = -1.0
