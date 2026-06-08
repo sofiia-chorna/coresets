@@ -9,10 +9,12 @@ the winner-rank slot for sharded) and is fed straight back into the commit.
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Set, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -23,6 +25,7 @@ from ._shared import (
     check_invariant_global,
     print_header,
     print_level_row,
+    rebuild_selected_state,
     reconstruct_hausdorff_with_voronoi_multi,
 )
 from .layout import ShardLayout
@@ -103,6 +106,7 @@ class MultiGPUAccrete(ABC):
         self.device = device
         self.dim = dim
         self.max_k = max_k
+        self.max_sel = max_sel   # final coreset size; < 2**max_k when an exact n_target is requested
         self.n_anchor_global = n_anchor_global
         self.n_global = n_global
         self.verbose = verbose
@@ -135,6 +139,11 @@ class MultiGPUAccrete(ABC):
         self.selected_set: Set[int] = set()
         self.sep: float = float("inf")
 
+        # mid-layer checkpointing (sharded only; 0 = layer-end checkpoints only). Written at SAFE
+        # points (between blocks / between fill picks), never inside a block's provisional forward.
+        self.checkpoint_every: int = 0
+        self._last_ckpt_n: int = 0
+
         self.profiler = PhaseTimer(enabled=profile, on_cuda=on_cuda)
         self.trace = Tracer(trace_path if layout.rank == 0 else None)
 
@@ -142,11 +151,6 @@ class MultiGPUAccrete(ABC):
 
     def run(self) -> Tensor:
         """Run the full FPS-accretion loop and return global coreset indices"""
-        first = self.anchor_indices[0]
-        self.selected.append(first)
-        self.selected_set.add(first)
-        self._seed(first)
-
         if self.verbose and self.layout.rank == 0:
             print_header(
                 self.DRIVER_NAME,
@@ -157,7 +161,21 @@ class MultiGPUAccrete(ABC):
                 self.layout.sizes,
             )
 
-        for k in range(1, self.max_k + 1):
+        # EXACT resume (sharded only): restore the partial coreset + sep from the last completed
+        # layer and rebuild hausdorff/voronoi from the selected set. The anchor hierarchy
+        # (nested_blocks, from idx_A) is unchanged, so layers grown after resume keep the SAME
+        # MAD-preference as an uninterrupted run -- no continuation/re-anchor relaxation.
+        resume_from = getattr(self, "resume_from", None)
+        if resume_from is not None:
+            start_k = self._resume_state(resume_from)
+        else:
+            first = self.anchor_indices[0]
+            self.selected.append(first)
+            self.selected_set.add(first)
+            self._seed(first)
+            start_k = 1
+
+        for k in range(start_k, self.max_k + 1):
             self._do_layer(k)
 
         if self.profile and self.layout.rank == 0:
@@ -166,10 +184,87 @@ class MultiGPUAccrete(ABC):
 
         return torch.tensor(self.selected, dtype=torch.long, device=self.device)
 
+    # --------------------------------------------------------------- resume
+
+    def _resume_state(self, prefix: str) -> int:
+        """Restore state from the last checkpoint and return the layer to START from.
+        ``_latest.txt`` holds either ``"{k}"`` (layer-end checkpoint -> start at k+1) or
+        ``"{k} {n}"`` (MID-layer rolling checkpoint with n selected -> re-enter layer k; the layer
+        budget recomputes as target - n and the block preference re-derives from selected_set).
+        selected/sep are restored; hausdorff/voronoi/X_sel rebuilt from the selected set. The
+        anchor hierarchy (nested_blocks) is untouched, so anchor preference is preserved."""
+        latest = f"{prefix}_latest.txt"
+        if not os.path.exists(latest):
+            raise FileNotFoundError(f"resume requires {latest}; not found.")
+        with open(latest) as f:
+            toks = f.read().split()
+        k0 = int(toks[0])
+        if k0 > self.max_k:
+            raise ValueError(
+                f"resume checkpoint is at layer k0={k0} but max_k={self.max_k}; "
+                "the checkpoint already exceeds the requested target. Increase max_k to extend."
+            )
+        if len(toks) >= 2:                                   # mid-layer rolling checkpoint
+            n0 = int(toks[1])
+            sel_prev = np.load(f"{prefix}_mid.npy").astype(np.int64, copy=False)
+            if sel_prev.shape[0] != n0:
+                raise ValueError(f"resume {prefix}_mid.npy has {sel_prev.shape[0]} ids, latest says {n0}")
+            lo, hi = 2 ** (k0 - 1), min(2 ** k0, self.max_sel)
+            if not (lo <= n0 <= hi):
+                raise ValueError(f"mid-layer resume n={n0} outside layer k={k0} range [{lo},{hi}]")
+            sep_file = f"{prefix}_mid_sep.npy"
+            # n0 == hi: the mid checkpoint landed exactly at layer completion (legacy files from
+            # before _maybe_midlayer_ckpt skipped that case) -> the layer is DONE, start at k0+1.
+            start_k = k0 if n0 < hi else k0 + 1
+        else:                                                # layer-end checkpoint
+            sel_prev = np.load(f"{prefix}_k{k0:02d}.npy").astype(np.int64, copy=False)
+            expected = min(2 ** k0, self.max_sel)            # final layer may be partial (n_target)
+            if sel_prev.shape[0] != expected:
+                raise ValueError(f"resume {prefix} k={k0}: {sel_prev.shape[0]} ids, expected {expected}")
+            sep_file = f"{prefix}_k{k0:02d}_sep.npy"
+            start_k = k0 + 1
+        if os.path.exists(sep_file):
+            sep_prev = float(np.load(sep_file)[0])
+        else:
+            sep_prev = float("inf")
+            if self.layout.rank == 0:
+                print(f"  [resume] WARNING: {sep_file} missing (checkpoint predates sep sidecars?) — "
+                      "sep restored as inf, so the sep>cov layer check is VACUOUS until new picks "
+                      "re-establish it.", flush=True)
+        self._rebuild_from_selected(sel_prev)
+        self.selected = sel_prev.tolist()
+        self.selected_set = set(self.selected)
+        self.sep = sep_prev
+        self._last_ckpt_n = len(self.selected)
+        if self.verbose and self.layout.rank == 0:
+            print(f"  [resume] restored {len(self.selected):,} centers "
+                  f"({'mid-layer ' if len(toks) >= 2 else ''}k={k0}, sep={sep_prev:.6g}); "
+                  f"continuing from layer {start_k} to {self.max_k}", flush=True)
+        return start_k
+
+    def _rebuild_from_selected(self, sel_prev_np: np.ndarray) -> None:
+        """Rebuild X_sel/norms_sel + hausdorff_shard/voronoi_shard from the selected global
+        indices — delegates to the SHARED reconstruction (same one FPS resume uses), so the
+        two resume paths cannot drift."""
+        rebuild_selected_state(
+            selected_prev_np=sel_prev_np,
+            X_local=self.x_shard_view,
+            norms_local=self.norms_shard_view,
+            X_sel=self.X_sel,
+            norms_sel=self.norms_sel,
+            hausdorff_shard=self.hausdorff_shard,
+            voronoi_shard=self.voronoi_shard,
+            layout=self.layout,
+            device=self.device,
+            verbose=self.verbose and self.layout.rank == 0,
+        )
+
     # ------------------------------------------------------------- internals
 
     def _do_layer(self, k: int) -> None:
-        target_size = 2**k
+        # clamp to max_sel: when an exact (non power-of-two) n_target is requested the FINAL
+        # layer is partial (budget = n_target - 2**(max_k-1)); all earlier layers are unchanged.
+        target_size = min(2**k, self.max_sel)
         budget = target_size - len(self.selected)
         if budget <= 0:
             return
@@ -181,13 +276,11 @@ class MultiGPUAccrete(ABC):
             if not desired:
                 continue
             budget = self._do_block(desired, budget)
+            self._maybe_midlayer_ckpt(k)        # safe point: block committed (post-bisect)
 
         # fill remainder with unconstrained FPS.
         with self.profiler("fill_s"):
-            while budget > 0:
-                if not self._fill_one():
-                    break
-                budget -= 1
+            budget = self._fill_many(budget, k)
 
         cov_sq, sep_val, cov_val, rel_gap = check_invariant_global(
             self.hausdorff_shard, self.sep, k, target_size, self.device, self.DRIVER_NAME
@@ -279,6 +372,18 @@ class MultiGPUAccrete(ABC):
         self.trace("fill", sel_pos, new_idx, best_val, self.sep)
         self._commit_argmax_winner(new_idx, sel_pos, ctx)
         return True
+
+    def _fill_many(self, budget: int, k: int) -> int:
+        """Run the unconstrained-FPS fill for up to ``budget`` picks; return the
+        unused budget. Default = one synchronous ``_fill_one`` per pick. Drivers
+        may override with a batched implementation, which MUST commit the exact
+        same picks in the exact same order (see ShardedDriver._fill_many)."""
+        while budget > 0:
+            if not self._fill_one():
+                break
+            budget -= 1
+            self._maybe_midlayer_ckpt(k)    # safe point: fill picks commit immediately
+        return budget
 
     def _snapshot(self) -> _LayerSnapshot:
         # only one snapshot is alive per _do_block, so sharing the persistent
@@ -390,6 +495,25 @@ class MultiGPUAccrete(ABC):
                 high = mid - 1
 
         return best
+
+    def _maybe_midlayer_ckpt(self, k: int) -> None:
+        """Write a rolling mid-layer checkpoint every ``checkpoint_every`` picks (safe points only).
+
+        Skipped when the layer just COMPLETED (len == target): the imminent layer-end checkpoint
+        from _post_layer_hook is authoritative there, and a mid-layer '{k} {target}' _latest.txt
+        would be rejected by _resume_state's range check if a crash hit before the layer-end write.
+        (The batched fill's last chunk always lands exactly on the target, making this common.)"""
+        if not self.checkpoint_every:
+            return
+        if len(self.selected) >= min(2 ** k, self.max_sel):
+            return
+        if (len(self.selected) - self._last_ckpt_n) >= self.checkpoint_every:
+            self._write_midlayer_checkpoint(k)
+            self._last_ckpt_n = len(self.selected)
+
+    def _write_midlayer_checkpoint(self, k: int) -> None:
+        """Override in drivers that support checkpointing (sharded). Default: no-op."""
+        pass
 
     def _post_layer_hook(self, k: int, target_size: int) -> None:
         """Override for post-layer side effects (e.g., sharded checkpointing)."""

@@ -42,6 +42,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from ..extension import ensure_compiled, get_ext
+from ._shared import rebuild_selected_state
 from .layout import ShardLayout
 
 
@@ -484,67 +485,20 @@ def _rebuild_state_from_selected(
     device,
     verbose: bool = True,
 ) -> None:
-    """Rebuild per-rank FPS state (X_sel, norms_sel, hausdorff_shard, voronoi_shard)
-    from the loaded ``selected_prev_np`` indices via batched matrix distance.
-
-    All operations are done in float32 for accuracy regardless of X_local dtype.
-    """
-    K_prev = int(selected_prev_np.shape[0])
-    dim = int(X_local.shape[1])
-    n_local = int(X_local.shape[0])
-
-    selected_prev = torch.from_numpy(selected_prev_np).to(device=device, dtype=torch.long)
-    selected[:K_prev] = selected_prev
-
-    # ---- 1. Reconstruct X_sel and norms_sel via all-reduce-sum ----
-    X_sel_f32 = torch.zeros((K_prev, dim), dtype=torch.float32, device=device)
-    norms_sel_f32 = torch.zeros(K_prev, dtype=torch.float32, device=device)
-
-    # owner mask: which picks are mine?
-    owners = np.array(
-        [layout.owner_of(int(g)) for g in selected_prev_np], dtype=np.int64
+    """Rebuild per-rank FPS state from ``selected_prev_np`` — thin wrapper over the SHARED
+    reconstruction in ``_shared.rebuild_selected_state`` (also used by the accrete resume),
+    so the two resume paths cannot drift. ``rank``/``world_size`` kept for signature
+    compatibility (derived from ``layout``)."""
+    rebuild_selected_state(
+        selected_prev_np=selected_prev_np,
+        X_local=X_local,
+        norms_local=norms_local,
+        X_sel=X_sel,
+        norms_sel=norms_sel,
+        hausdorff_shard=hausdorff_shard,
+        voronoi_shard=voronoi_shard,
+        layout=layout,
+        device=device,
+        selected_out=selected,
+        verbose=verbose,
     )
-    mine = np.where(owners == rank)[0]
-    if mine.size > 0:
-        local_ix = torch.tensor(
-            [layout.to_local(int(selected_prev_np[j])) for j in mine],
-            dtype=torch.long, device=device,
-        )
-        # write rows in bulk
-        X_sel_f32[torch.from_numpy(mine).to(device)] = X_local[local_ix].to(torch.float32)
-        norms_sel_f32[torch.from_numpy(mine).to(device)] = norms_local[local_ix]
-
-    dist.all_reduce(X_sel_f32, op=dist.ReduceOp.SUM)
-    dist.all_reduce(norms_sel_f32, op=dist.ReduceOp.SUM)
-
-    X_sel[:K_prev] = X_sel_f32.to(X_sel.dtype)
-    norms_sel[:K_prev] = norms_sel_f32
-
-    # ---- 2. Recompute hausdorff_shard + voronoi_shard in chunks ----
-    bytes_budget = 6 * 1024 ** 3  # 6 GiB per distance tile
-    CHUNK = max(16, min(1024, bytes_budget // max(n_local * 4, 1)))
-    hausdorff_shard.fill_(float("inf"))
-    voronoi_shard.zero_()
-
-    if n_local > 0:
-        X_local_f32 = X_local.to(torch.float32)
-        norms_local_col = norms_local.unsqueeze(1)  # (N_local, 1)
-
-        for c0 in range(0, K_prev, CHUNK):
-            c1 = min(c0 + CHUNK, K_prev)
-            X_chunk = X_sel_f32[c0:c1]                          # (chunk, D)
-            n_chunk = norms_sel_f32[c0:c1].unsqueeze(0)         # (1, chunk)
-            dots = X_local_f32 @ X_chunk.T                      # (N_local, chunk)
-            dists = norms_local_col + n_chunk - 2.0 * dots
-            chunk_min, chunk_argmin = dists.min(dim=1)
-            better = chunk_min < hausdorff_shard
-            hausdorff_shard.copy_(torch.where(better, chunk_min, hausdorff_shard))
-            voronoi_shard.copy_(
-                torch.where(better, (chunk_argmin + c0).to(torch.long), voronoi_shard)
-            )
-            if verbose and (c1 % (CHUNK * 16) == 0 or c1 == K_prev):
-                print(f"  rebuild chunk {c1:,}/{K_prev:,}", flush=True)
-
-        # Mark selected-from-this-rank rows as -1 so they're never re-picked
-        if mine.size > 0:
-            hausdorff_shard[local_ix] = -1.0

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -203,6 +204,83 @@ def reconstruct_hausdorff_with_voronoi_multi(
     return h_mid, voronoi_mid
 
 
+def rebuild_selected_state(
+    *,
+    selected_prev_np: np.ndarray,
+    X_local: Tensor,
+    norms_local: Tensor,
+    X_sel: Tensor,
+    norms_sel: Tensor,
+    hausdorff_shard: Tensor,
+    voronoi_shard: Tensor,
+    layout,
+    device,
+    selected_out: Optional[Tensor] = None,
+    verbose: bool = False,
+) -> None:
+    """Rebuild resume state from a selected-index prefix (SHARED by FPS and accrete).
+
+    Reconstructs the replicated ``X_sel``/``norms_sel`` (all-reduce-sum of owner rows) and this
+    rank's ``hausdorff_shard``/``voronoi_shard`` (chunked f32 batched distance, ~6 GiB tiles),
+    then marks locally-owned selected rows ``-1`` so they are never re-picked. All math in f32
+    regardless of ``X_local`` dtype — IDENTICAL expression order to the original twin
+    implementations so resumed states stay bit-compatible.
+
+    Args:
+        selected_prev_np: ``(K_prev,)`` int64 global indices in pick order.
+        selected_out: optional device long tensor; its first ``K_prev`` slots are filled with
+            the restored indices (the FPS driver keeps ``selected`` on device).
+    """
+    K_prev = int(selected_prev_np.shape[0])
+    dim = int(X_local.shape[1])
+    n_local = int(X_local.shape[0])
+    rank = layout.rank
+
+    if selected_out is not None:
+        selected_out[:K_prev] = torch.from_numpy(selected_prev_np).to(device=device, dtype=torch.long)
+
+    # ---- 1. reconstruct X_sel / norms_sel via all-reduce-sum of owner rows ----
+    X_sel_f32 = torch.zeros((K_prev, dim), dtype=torch.float32, device=device)
+    norms_sel_f32 = torch.zeros(K_prev, dtype=torch.float32, device=device)
+    # vectorized owner/local mapping (was a per-element Python owner_of() loop — minutes of
+    # pure Python at K_prev ~ 10M): offsets are sorted shard starts, so the owner of g is the
+    # last rank whose offset <= g. Equivalent to layout.owner_of for empty shards too (the
+    # rightmost rank sharing the offset owns the rows).
+    offsets = np.asarray(layout.offsets, dtype=np.int64)
+    owners = np.searchsorted(offsets, selected_prev_np, side="right") - 1
+    mine = np.where(owners == rank)[0]
+    local_ix = None
+    if mine.size > 0:
+        local_ix = torch.from_numpy(selected_prev_np[mine] - int(offsets[rank])).to(
+            device=device, dtype=torch.long)
+        mine_t = torch.from_numpy(mine).to(device)
+        X_sel_f32[mine_t] = X_local[local_ix].to(torch.float32)
+        norms_sel_f32[mine_t] = norms_local[local_ix].to(torch.float32)
+    dist.all_reduce(X_sel_f32, op=dist.ReduceOp.SUM)
+    dist.all_reduce(norms_sel_f32, op=dist.ReduceOp.SUM)
+    X_sel[:K_prev] = X_sel_f32.to(X_sel.dtype)
+    norms_sel[:K_prev] = norms_sel_f32
+
+    # ---- 2. recompute hausdorff/voronoi against the selected set, in chunks ----
+    hausdorff_shard.fill_(float("inf"))
+    voronoi_shard.zero_()
+    if n_local > 0:
+        CHUNK = max(16, min(1024, (6 * 1024 ** 3) // max(n_local * 4, 1)))
+        Xl32 = X_local.to(torch.float32)
+        nl_col = norms_local.to(torch.float32).unsqueeze(1)
+        for c0 in range(0, K_prev, CHUNK):
+            c1 = min(c0 + CHUNK, K_prev)
+            dists = nl_col + norms_sel_f32[c0:c1].unsqueeze(0) - 2.0 * (Xl32 @ X_sel_f32[c0:c1].T)
+            cmin, carg = dists.min(dim=1)
+            better = cmin < hausdorff_shard
+            hausdorff_shard.copy_(torch.where(better, cmin, hausdorff_shard))
+            voronoi_shard.copy_(torch.where(better, (carg + c0).to(torch.long), voronoi_shard))
+            if verbose and (c1 % (CHUNK * 16) == 0 or c1 == K_prev):
+                print(f"  rebuild chunk {c1:,}/{K_prev:,}", flush=True)
+        if local_ix is not None:
+            hausdorff_shard[local_ix] = -1.0   # selected rows never re-picked (FPS convention)
+
+
 def resolve_max_k(
     max_k: int | None,
     n_global: int,
@@ -257,6 +335,14 @@ def check_invariant_global(
     (well below float32 noise; the f64 verifier is authoritative).
     """
     GROSS_REL = 1e-3
+
+    # Exact-duplicate rows make the true separation 0, and float32 distance
+    # arithmetic (||x||^2+||y||^2-2x.y) can leave sep_sq a hair NEGATIVE.
+    # Distances are >= 0 by definition, so clamp; otherwise a full-coverage
+    # final layer (cov_sq=0, e.g. n_target=N_global with duplicate rows)
+    # trips the raise on noise. A real violation (cov_sq > 0) still raises.
+    if math.isfinite(sep_sq):
+        sep_sq = max(0.0, sep_sq)
 
     local_cov_sq = max(0.0, float(hausdorff_shard.max().item()))
     cov_t = torch.tensor([local_cov_sq], device=device, dtype=torch.float32)

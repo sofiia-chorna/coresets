@@ -44,6 +44,8 @@ class ShardedDriver(MultiGPUAccrete):
         profile: bool,
         trace_path: Optional[str],
         checkpoint_path: Optional[str],
+        resume_from: Optional[str] = None,
+        checkpoint_every: int = 0,
     ):
         """Build the sharded-X driver.
 
@@ -87,6 +89,11 @@ class ShardedDriver(MultiGPUAccrete):
         self.X_local = X_local
         self.norms_local = norms_local
         self.checkpoint_path = checkpoint_path
+        self.resume_from = resume_from
+        self.checkpoint_every = int(checkpoint_every)   # picks between rolling mid-layer ckpts (0=off)
+        # batched-fill chunk size, read ONCE here (process-global, can't change mid-run): picks
+        # committed per host sync in _fill_many. 0 = the base per-pick loop (default).
+        self._fill_chunk = int(os.environ.get("CORESETS_FILL_CHUNK", "0"))
 
         # views read by the base bisect
         self.x_shard_view = X_local
@@ -99,12 +106,13 @@ class ShardedDriver(MultiGPUAccrete):
         self._pack_row_by_owner(first, owner)
         self._voronoi_step(first, 0, owner, owner)
 
-    def _argmax_global(self) -> Tuple[float, int, Any]:
+    def _local_argmax_pack(self) -> None:
+        """argmax over this rank's hausdorff + pack (val, idx, norm, row) into
+        ``scratch.argmax_local_pack`` (a neg-inf pack for 0-row shards). SHARED by the
+        per-pick _argmax_global and the batched _fill_many so the two cannot drift."""
         ext = get_ext()
         layout = self.layout
         scratch = self.scratch
-        stride = scratch.stride
-
         if layout.N_shard > 0:
             ext.argmax_cuda(
                 self.hausdorff_shard,
@@ -120,9 +128,35 @@ class ShardedDriver(MultiGPUAccrete):
         else:
             ext.fill_pack_with_row_neg_inf_cuda(scratch.argmax_local_pack, int(self.dim))
 
+    def _update_kernels(self, sel_pos: int) -> None:
+        """Distance-update kernels against ``X_sel[sel_pos]`` (the fps_update seed path at
+        sel_pos==0). SHARED by _voronoi_step and the batched _fill_many — a future kernel
+        change lands in both paths by construction."""
+        ext = get_ext()
+        scratch = self.scratch
+        x_new = self.X_sel[sel_pos]
+        norm_new = self.norms_sel[sel_pos : sel_pos + 1]
+        if sel_pos == 0:
+            ext.fps_update_cuda(
+                self.X_local, self.norms_local, x_new,
+                self.hausdorff_shard, self.voronoi_shard, norm_new, sel_pos,
+            )
+        else:
+            ext.compute_dSL_quarter_cuda(self.X_sel, self.norms_sel, scratch.dSL_quarter, sel_pos)
+            ext.voronoi_update_cuda(
+                self.X_local, self.norms_local, x_new,
+                scratch.dSL_quarter[:sel_pos],
+                self.hausdorff_shard, self.voronoi_shard, norm_new, sel_pos,
+            )
+
+    def _argmax_global(self) -> Tuple[float, int, Any]:
+        scratch = self.scratch
+        stride = scratch.stride
+
+        self._local_argmax_pack()
         dist.all_gather_into_tensor(scratch.argmax_gather_buf, scratch.argmax_local_pack)
 
-        gathered = scratch.argmax_gather_buf.view(layout.world_size, stride)
+        gathered = scratch.argmax_gather_buf.view(self.layout.world_size, stride)
         winner = int(torch.argmax(gathered[:, 0]).item())
         best_val = float(gathered[winner, 0].item())
         best_idx = int(gathered.view(torch.int32)[winner, 1].item())
@@ -169,6 +203,88 @@ class ShardedDriver(MultiGPUAccrete):
         with self.profiler("voronoi_step_s"):
             self._voronoi_step(new_idx, sel_pos, int(ctx), self.layout.owner_of(new_idx))
 
+    def _fill_many(self, budget: int, k: int) -> int:
+        """Batched, sync-free fill: chunks of picks decided entirely ON DEVICE.
+
+        Commits the EXACT same picks in the EXACT same order as the base per-pick loop. It calls
+        the SAME shared primitives the per-pick path uses — ``_local_argmax_pack`` (argmax+pack)
+        and ``_update_kernels`` (distance update) — so the two paths cannot drift on a future
+        kernel change. The ONLY differences vs the base loop: (a) the winner/index reads stay on
+        device (no per-pick ``.item()`` sync; same first-max ``argmax`` tie-break), and (b) host
+        bookkeeping (selected list, sep, mid-layer ckpt) happens once per chunk. Opt-in via
+        ``self._fill_chunk`` (env ``CORESETS_FILL_CHUNK``, read once in __init__; 0 = base loop);
+        falls back to the base loop when tracing is active or nothing is selected yet (seed path).
+
+        Per-pick the old loop pays ~3 GPU->host syncs; at production scale that is ~5 ms/pick of
+        latency vs ~0.1-1 ms of kernel work. One sync per chunk removes that wall-clock floor.
+        """
+        chunk = self._fill_chunk
+        if chunk <= 0 or getattr(self.trace, "_f", None) is not None or len(self.selected) == 0:
+            return super()._fill_many(budget, k)
+
+        scratch = self.scratch
+        stride = scratch.stride
+        dim = self.dim
+        dev = self.X_local.device
+        off = int(self.layout.shard_offset)
+        nsh = int(self.layout.N_shard)
+        idx_buf = torch.empty(chunk, dtype=torch.long, device=dev)
+        val_buf = torch.empty(chunk, dtype=torch.float32, device=dev)
+        neg1 = torch.tensor(-1.0, dtype=self.hausdorff_shard.dtype, device=dev)
+        sp_buf = torch.empty(1, dtype=self.voronoi_shard.dtype, device=dev)  # reused sel_pos holder
+
+        while budget > 0:
+            m = min(chunk, budget)
+            base_sel = len(self.selected)
+            for j in range(m):
+                sel_pos = base_sel + j
+                # ---- argmax + pack + gather: SAME primitive as _argmax_global ----
+                self._local_argmax_pack()
+                dist.all_gather_into_tensor(scratch.argmax_gather_buf, scratch.argmax_local_pack)
+
+                # ---- winner decision stays on device (same first-max tie-break) ----
+                gathered = scratch.argmax_gather_buf.view(self.layout.world_size, stride)
+                # 0-dim-tensor indexing returns a VIEW aliasing argmax_gather_buf; clone()
+                # detaches it so no read can ever alias the NEXT pick's all_gather.
+                pack = gathered[gathered[:, 0].argmax()].clone()  # (stride,) device copy
+                val_buf[j] = pack[0]
+                gidx = pack.view(torch.int32)[1].long()           # global idx, device scalar
+                idx_buf[j] = gidx
+
+                # ---- commit: device-side twin of _voronoi_step's row-copy + owner mask, then
+                #      the SHARED _update_kernels (identical to the per-pick path) ----
+                self.X_sel[sel_pos].copy_(pack[3 : 3 + dim])
+                self.norms_sel[sel_pos] = pack[2]
+                if nsh > 0:                                       # owner branch as a masked write
+                    mine = (gidx >= off) & (gidx < off + nsh)
+                    loc = (gidx - off).clamp_(0, nsh - 1)
+                    self.hausdorff_shard[loc] = torch.where(mine, neg1, self.hausdorff_shard[loc])
+                    sp_buf.fill_(sel_pos)
+                    self.voronoi_shard[loc] = torch.where(mine, sp_buf[0], self.voronoi_shard[loc])
+                self._update_kernels(sel_pos)
+
+            # ---- ONE host sync per chunk: bookkeeping identical to the base loop ----
+            idx_cpu = idx_buf[:m].tolist()
+            val_cpu = val_buf[:m].tolist()
+            # Tiny-NEGATIVE vals are LEGITIMATE duplicate-tail picks (float32
+            # ||x||^2+||y||^2-2x.y noise on near-identical rows; same phenomenon as the
+            # sep_sq clamp in check_invariant_global) — the base loop commits them too.
+            # True exhaustion shows as the selected-marker -1.0 (re-pick) or idx<0.
+            if min(idx_cpu) < 0 or min(val_cpu) < -0.5:
+                raise RuntimeError(
+                    f"{self.DRIVER_NAME}: batched fill committed an invalid pick "
+                    f"(min idx={min(idx_cpu)}, min val={min(val_cpu):.3e}) — candidate pool "
+                    "exhausted mid-chunk (re-picked a selected row). This cannot happen for "
+                    "n_target <= N_global; rerun with CORESETS_FILL_CHUNK=0 and report."
+                )
+            for v, gi in zip(val_cpu, idx_cpu):
+                self.sep = min(self.sep, v)
+                self.selected.append(int(gi))
+                self.selected_set.add(int(gi))
+            budget -= m
+            self._maybe_midlayer_ckpt(k)        # safe point: chunk fully committed
+        return budget
+
     def _commit_fixed(self, new_idx: int, sel_pos: int) -> None:
         # replay path: idx is known but no argmax happened, so gather the row first
         owner = self.layout.owner_of(new_idx)
@@ -204,7 +320,6 @@ class ShardedDriver(MultiGPUAccrete):
         owner_rank: int,
     ) -> None:
         """Commit using the row carried in ``argmax_gather_buf[winner_rank]``"""
-        ext = get_ext()
         scratch = self.scratch
         stride = scratch.stride
         base = winner_rank * stride
@@ -218,21 +333,7 @@ class ShardedDriver(MultiGPUAccrete):
             self.hausdorff_shard[local_idx] = -1.0
             self.voronoi_shard[local_idx] = sel_pos
 
-        x_new = self.X_sel[sel_pos]
-        norm_new = self.norms_sel[sel_pos : sel_pos + 1]
-
-        if sel_pos == 0:
-            ext.fps_update_cuda(
-                self.X_local, self.norms_local, x_new,
-                self.hausdorff_shard, self.voronoi_shard, norm_new, sel_pos,
-            )
-        else:
-            ext.compute_dSL_quarter_cuda(self.X_sel, self.norms_sel, scratch.dSL_quarter, sel_pos)
-            ext.voronoi_update_cuda(
-                self.X_local, self.norms_local, x_new,
-                scratch.dSL_quarter[:sel_pos],
-                self.hausdorff_shard, self.voronoi_shard, norm_new, sel_pos,
-            )
+        self._update_kernels(sel_pos)
 
     def _simulate(
         self,
@@ -282,7 +383,32 @@ class ShardedDriver(MultiGPUAccrete):
 
     def _post_layer_hook(self, k: int, target_size: int) -> None:
         if self.checkpoint_path is not None and self.layout.rank == 0:
-            _write_checkpoint(self.checkpoint_path, k, self.selected, target_size, self.verbose)
+            _write_checkpoint(self.checkpoint_path, k, self.selected, target_size, self.sep, self.verbose)
+        self._last_ckpt_n = len(self.selected)   # layer-end ckpt supersedes the rolling mid one
+
+    def _write_midlayer_checkpoint(self, k: int) -> None:
+        """Rolling mid-layer dump (rank 0): {path}_mid.npy + _mid_sep.npy, then _latest.txt =
+        '{k} {n}' (two tokens marks a mid-layer state; resume re-enters layer k). Atomic."""
+        if self.checkpoint_path is None or self.layout.rank != 0:
+            return
+        n = len(self.selected)
+        mid_file = f"{self.checkpoint_path}_mid.npy"
+        tmp = mid_file + ".tmp"
+        with open(tmp, "wb") as f:
+            np.save(f, np.asarray(self.selected, dtype=np.int64), allow_pickle=False)
+        os.replace(tmp, mid_file)
+        sep_file = f"{self.checkpoint_path}_mid_sep.npy"
+        tmp = sep_file + ".tmp"
+        with open(tmp, "wb") as f:
+            np.save(f, np.asarray([self.sep], dtype=np.float64), allow_pickle=False)
+        os.replace(tmp, sep_file)
+        latest = f"{self.checkpoint_path}_latest.txt"
+        tmp = latest + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"{k} {n}\n")
+        os.replace(tmp, latest)
+        if self.verbose:
+            print(f"  [checkpoint] mid-layer k={k} n={n:,} => {mid_file}", flush=True)
 
 
 # -------------------------------------------------------- underlying entry point
@@ -298,10 +424,13 @@ def accrete_voronoi_multi_sharded(
     idx_A: Tensor,
     *,
     max_k: Optional[int] = None,
+    n_target: Optional[int] = None,
     verbose: bool = True,
     profile: bool = False,
     trace_path: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    checkpoint_every: int = 0,
 ) -> Tensor:
     """Multi-GPU CUDA accrete with X sharded across ranks.
 
@@ -345,6 +474,20 @@ def accrete_voronoi_multi_sharded(
 
     max_k, max_sel = resolve_max_k(max_k, N_global, dim, X_local.element_size(), device)
 
+    # exact final size: dyadic layers up to 2**(max_k-1), then ONE partial final layer to n_target.
+    if n_target is not None:
+        if not (2 ** (max_k - 1) < n_target <= 2 ** max_k):
+            raise ValueError(
+                f"n_target={n_target} must satisfy 2**(max_k-1) < n_target <= 2**max_k "
+                f"({2 ** (max_k - 1)} < n_target <= {2 ** max_k} for max_k={max_k})"
+            )
+        if n_target > N_global:
+            # over-asking makes the fill re-pick selected rows (hausdorff=-1) once the pool is
+            # exhausted: silent duplicates in the base loop, a late RuntimeError in the batched
+            # one. Refuse up front.
+            raise ValueError(f"n_target={n_target} exceeds the pool size N_global={N_global}")
+        max_sel = n_target
+
     driver = ShardedDriver(
         X_local=X_local,
         norms_local=norms_local,
@@ -359,6 +502,8 @@ def accrete_voronoi_multi_sharded(
         profile=profile,
         trace_path=trace_path,
         checkpoint_path=checkpoint_path,
+        resume_from=resume_from,
+        checkpoint_every=checkpoint_every,
     )
     return driver.run()
 
@@ -372,7 +517,10 @@ def accrete_sharded(
     n_anchor: int,
     *,
     max_k: Optional[int] = None,
+    n_target: Optional[int] = None,
     checkpoint_path: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    checkpoint_every: int = 0,
     trace_path: Optional[str] = None,
     verbose: bool = True,
     profile: bool = False,
@@ -396,7 +544,11 @@ def accrete_sharded(
         n_anchor: number of anchor rows.
         max_k: final coreset size = ``2 ** max_k``. **Pin in production** —
             auto-derivation can shrink between chained continuation runs.
-        checkpoint_path: rank 0 writes ``{path}_k{k:02d}.npy`` after each layer.
+        checkpoint_path: rank 0 writes ``{path}_k{k:02d}.npy`` (+ ``_sep.npy``) after each layer.
+        resume_from: prefix of a previous run's ``checkpoint_path``. Restores the partial coreset
+            + ``sep`` from the last completed layer, rebuilds hausdorff/voronoi from the selected
+            set (like FPS), and continues with the SAME MAD anchor hierarchy — so the MAD-hierarchy
+            preference is preserved (no continuation/re-anchor relaxation). Use the same X layout.
         trace_path: diagnostic trace file (rank 0 only).
 
     Returns global coreset indices (``2 ** max_k`` int64). Same tensor on every rank.
@@ -437,10 +589,13 @@ def accrete_sharded(
         shard_sizes=shard_sizes,
         idx_A=anchor_order,
         max_k=max_k,
+        n_target=n_target,
         verbose=verbose,
         profile=profile,
         trace_path=trace_path,
         checkpoint_path=checkpoint_path,
+        resume_from=resume_from,
+        checkpoint_every=checkpoint_every,
     )
 
 
@@ -500,14 +655,24 @@ def _check_anchor_range(idx_A, N_global):
         )
 
 
-def _write_checkpoint(checkpoint_path, k, selected, target_size, verbose):
-    """Atomic per-layer dump (rank 0). Updates ``_latest.txt`` last."""
+def _write_checkpoint(checkpoint_path, k, selected, target_size, sep, verbose):
+    """Atomic per-layer dump (rank 0). Updates ``_latest.txt`` last.
+
+    Saves the selected set AND ``sep`` (the running min separation) so an exact resume can
+    restore the full accretion state without re-deriving it (hausdorff/voronoi are rebuilt from
+    the selected set; ``sep`` is the one scalar that the selected set alone does not pin down)."""
     ckpt_file = f"{checkpoint_path}_k{k:02d}.npy"
     tmp_file = ckpt_file + ".tmp"
     coreset_np = np.asarray(selected[:target_size], dtype=np.int64)
     with open(tmp_file, "wb") as f:
         np.save(f, coreset_np, allow_pickle=False)
     os.replace(tmp_file, ckpt_file)
+
+    sep_file = f"{checkpoint_path}_k{k:02d}_sep.npy"
+    sep_tmp = sep_file + ".tmp"
+    with open(sep_tmp, "wb") as f:
+        np.save(f, np.asarray([sep], dtype=np.float64), allow_pickle=False)
+    os.replace(sep_tmp, sep_file)
 
     latest_file = f"{checkpoint_path}_latest.txt"
     latest_tmp = latest_file + ".tmp"
