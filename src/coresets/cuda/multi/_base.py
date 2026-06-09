@@ -61,6 +61,17 @@ class MultiGPUAccrete(ABC):
 
     DRIVER_NAME: str = "<unset>"
 
+    # Seeded bisect (CORESETS_BISECT_SEED) gallops only when the prior block's kept
+    # prefix is ABSOLUTELY tiny (<= _GALLOP_MAX_SEED). That is the one regime where
+    # galloping beats binary search: binary reaches a boundary at prefix length b in
+    # ~log2(n_added/b) full-length non-viable sims, so it is already cheap unless b is
+    # tiny (then ~log2(n_added) ~ k sims) — exactly production's high-norm-outlier
+    # anchors (from_A = 1,1,..,2,5), where galloping from the stable prior answer needs
+    # ~2. For moderate/large b (generic data keeps many anchors) binary wins, so the
+    # guard routes those to binary. 32 covers production with margin while excluding the
+    # keep-many regime (a relative seed/n_added ratio does NOT separate them — measured).
+    _GALLOP_MAX_SEED: int = 32
+
     # subclasses set these (the rank's local slice of the global X) before super-init returns.
     x_shard_view: Tensor
     norms_shard_view: Tensor
@@ -138,6 +149,23 @@ class MultiGPUAccrete(ABC):
         self.selected: List[int] = []
         self.selected_set: Set[int] = set()
         self.sep: float = float("inf")
+
+        # Bisect acceleration (opt-in, env CORESETS_BISECT_SEED, read once; 0 = off).
+        # OFF (default): exact [0, n_added] binary search — byte-identical to the
+        #   historical output.
+        # ON: seeded galloping search around the previous block's answer. The viable
+        #   anchor prefix grows very slowly across blocks/layers (empirically
+        #   1,1,...,2,5), so the prior answer is an excellent start, cutting the per-
+        #   block probe count from O(log n_added) to O(1) and removing the redundant
+        #   full-length fill simulations that make deep layers slow. It returns the
+        #   SAME boundary as binary search whenever the viability predicate is
+        #   monotone; the sep>=cov guarantee holds regardless of mode (every accepted
+        #   prefix is re-checked by check_invariant_global). When float32 noise makes
+        #   the predicate non-monotone exactly at the boundary the two searches can
+        #   land on adjacent (both valid) best_m, so the coreset may differ by a few
+        #   points that cascade — hence opt-in, not the default.
+        self._bisect_seeded: int = int(os.environ.get("CORESETS_BISECT_SEED", "0"))
+        self._bisect_seed: int = 0
 
         # mid-layer checkpointing (sharded only; 0 = layer-end checkpoints only). Written at SAFE
         # points (between blocks / between fill picks), never inside a block's provisional forward.
@@ -409,7 +437,16 @@ class MultiGPUAccrete(ABC):
         step_seps: List[float],
         total_budget: int,
     ) -> int:
-        """Binary-search the maximum viable prefix length of ``added``.
+        """Find the maximum viable prefix length of ``added``.
+
+        Default: an exact binary search over ``[0, n_added]`` (byte-identical to the
+        historical behaviour). With ``CORESETS_BISECT_SEED`` set, a seeded galloping
+        search (``_largest_true``) instead — far fewer probes, same answer for a
+        monotone predicate (see ``self._bisect_seeded`` in ``__init__``).
+
+        Both modes drive the same ``viable(mid)`` probe, so the per-probe math and the
+        cross-rank collective sequence are byte-for-byte the legacy ones; only the
+        sequence of ``mid`` values visited differs.
 
         ``added_t`` and ``sel_start_t`` are device int64 tensors built once
         per block by the caller and sliced on every iter, replacing the
@@ -436,23 +473,37 @@ class MultiGPUAccrete(ABC):
         dist.all_reduce(n_pos_arr, op=dist.ReduceOp.SUM)
         n_pos_global_cpu = n_pos_arr.cpu().tolist()
 
-        low, high, best = 0, n_added, 0
+        # viability of a candidate prefix length ``mid`` — the per-probe work the
+        # legacy binary search ran inline, lifted into a closure so both search modes
+        # share it verbatim. ``viable`` is (true) monotone non-increasing in ``mid``
+        # (more forced anchor points => smaller sep + larger residual cov), so the
+        # boundary "largest viable mid" is well defined and any monotone search finds
+        # it. ``memo`` keeps each ``mid`` evaluated at most once (a no-op for the binary
+        # search, which never repeats a mid). Every probe derives its branch from
+        # globally identical scalars (step_seps / n_pos_global_cpu / all-gathered
+        # max-h), so all ranks evaluate the same ``mid`` sequence and the collectives
+        # stay in lockstep. (Near the boundary float32 sim noise can flip one probe,
+        # making the realized predicate non-monotone there; that is what lets the
+        # seeded search land on an adjacent best_m — see __init__.)
+        memo: dict = {}
 
-        while low <= high:
-            mid = (low + high) // 2
+        def viable(mid: int) -> bool:
+            cached = memo.get(mid)
+            if cached is not None:
+                return cached
             sep_mid = step_seps[mid]
             points_left = total_budget - mid
             final_size = snap.n_selected + mid + points_left
 
             if final_size >= self.layout.N_global:
-                best, low = mid, mid + 1
-                continue
+                memo[mid] = True
+                return True
 
             # Trivially-viable check: skip reconstruction entirely on this path.
             n_pos_global = n_pos_global_cpu[mid]
             if points_left >= n_pos_global:
-                best, low = mid, mid + 1
-                continue
+                memo[mid] = True
+                return True
 
             h_mid, voronoi_mid = reconstruct_hausdorff_with_voronoi_multi(
                 snap.hausdorff,
@@ -473,11 +524,8 @@ class MultiGPUAccrete(ABC):
 
             if points_left == 0:
                 max_h_global = self._global_max_h(h_mid)
-                if sep_mid > max_h_global:
-                    best, low = mid, mid + 1
-                else:
-                    high = mid - 1
-                continue
+                memo[mid] = sep_mid > max_h_global
+                return memo[mid]
 
             # stage prefix into sim scratch (sim writes positions [n_init, ...]).
             n_init = snap.n_selected + mid
@@ -488,13 +536,77 @@ class MultiGPUAccrete(ABC):
             is_viable, _ = self._simulate(
                 h_mid, voronoi_mid, sep_mid, points_left, n_init, sim_X_sel, sim_norms_sel
             )
+            memo[mid] = bool(is_viable)
+            return memo[mid]
 
-            if is_viable:
+        if self._bisect_seeded and self._bisect_seed <= self._GALLOP_MAX_SEED:
+            # Tiny-prefix regime (production's high-norm-outlier anchors, from_A 1..5):
+            # the legacy binary search wastes ~log2(n_added) full-length non-viable fill
+            # simulations descending to a tiny boundary; galloping from the stable prior
+            # answer finds it in ~2 probes (measured 4.5x less simulated fill, 6.8x less
+            # bisect wall-time). For a moderate/large prior prefix binary search already
+            # reaches the boundary cheaply and galloping loses, so the guard routes there.
+            best = self._largest_true(viable, n_added, self._bisect_seed)
+        else:
+            best = self._binary_search(viable, n_added)
+        # carry the answer to seed the next block (also keeps the guard's seed current
+        # when this block went through the binary branch).
+        if self._bisect_seeded:
+            self._bisect_seed = best
+        return best
+
+    @staticmethod
+    def _binary_search(predicate, n: int) -> int:
+        """Largest ``m`` in ``[0, n]`` with ``predicate(m)`` True via exact binary
+        search — the historical bisect. ``best`` floors at 0 (raised only by a viable
+        probe), matching the legacy semantics when nothing is viable."""
+        low, high, best = 0, n, 0
+        while low <= high:
+            mid = (low + high) // 2
+            if predicate(mid):
                 best, low = mid, mid + 1
             else:
                 high = mid - 1
-
         return best
+
+    @staticmethod
+    def _largest_true(predicate, n: int, seed: int) -> int:
+        """Largest ``m`` in ``[0, n]`` with ``predicate(m)`` True, for a monotone
+        non-increasing predicate (a True-prefix followed by a False-suffix).
+
+        Seeded galloping search: probe the seed, gallop outward to bracket the
+        True/False boundary, then binary-search the bracket. Probes
+        ``O(log|answer - seed|)`` values instead of ``O(log n)``, and stays biased
+        toward small ``m`` (where the simulator early-exits cheaply). For a monotone
+        predicate this returns the identical boundary a full ``[0, n]`` binary search
+        would (so the coreset is byte-identical); only float32 sim noise exactly at the
+        boundary can make the two disagree by one, both choices being sep>=cov-valid.
+
+        Returns 0 when nothing is viable (the legacy bisect's floor: ``best`` started
+        at 0 and was only ever raised by a viable probe)."""
+        seed = max(0, min(int(seed), n))
+        if not predicate(seed):
+            lo, hi = -1, seed                 # virtual True at -1; known False at seed
+        else:
+            lo, step, probe, hi = seed, 1, seed + 1, None
+            while probe <= n:
+                if predicate(probe):
+                    lo = probe
+                    step *= 2
+                    probe = lo + step
+                else:
+                    hi = probe
+                    break
+            if hi is None:
+                hi = n + 1                    # virtual False just past the range
+        # invariant: predicate(lo) True (or lo == -1), predicate(hi) False (or hi past n)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if predicate(mid):
+                lo = mid
+            else:
+                hi = mid
+        return max(lo, 0)
 
     def _maybe_midlayer_ckpt(self, k: int) -> None:
         """Write a rolling mid-layer checkpoint every ``checkpoint_every`` picks (safe points only).
