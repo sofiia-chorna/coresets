@@ -72,6 +72,17 @@ class MultiGPUAccrete(ABC):
     # keep-many regime (a relative seed/n_added ratio does NOT separate them — measured).
     _GALLOP_MAX_SEED: int = 32
 
+    # The gallop walks +-1 for this many steps before the stride starts doubling.
+    # Probe cost is wildly asymmetric: a viable (True) probe early-exits the fill
+    # simulation, a non-viable (False) probe must run the FULL remaining-budget fill
+    # to discover failure. The answer drifts from the seed by 0..3 per block in
+    # production, so a doubling stride overshoots the boundary and then pays
+    # ~log2(overshoot) full-length False sims bracketing back (measured: 3 at the
+    # deepest v1 layer). Walking +1 first crosses the boundary at the first False —
+    # exactly ONE full-length sim per block — while the stride doubling after
+    # _GALLOP_LINEAR steps keeps O(log) probes for rare regime jumps.
+    _GALLOP_LINEAR: int = 4
+
     # subclasses set these (the rank's local slice of the global X) before super-init returns.
     x_shard_view: Tensor
     norms_shard_view: Tensor
@@ -166,6 +177,35 @@ class MultiGPUAccrete(ABC):
         #   points that cascade — hence opt-in, not the default.
         self._bisect_seeded: int = int(os.environ.get("CORESETS_BISECT_SEED", "0"))
         self._bisect_seed: int = 0
+        # Lazy forward pass (rides the seeded mode; CORESETS_LAZY_FORWARD=0 disables it
+        # for A/B isolation). In the tiny-seed regime the forward greedily commits
+        # ~budget anchors per block — each an O(N) voronoi update — only for the bisect
+        # to keep ~seed of them. Greedy picks have the prefix property (pick j depends
+        # only on the j-1 commits before it), so the forward can stop at seed+1 picks
+        # and EXTEND on demand when the galloping search probes past it: the realized
+        # pick sequence is exactly the uninterrupted one. Off (default path): the full
+        # forward runs as always — byte-identical.
+        self._lazy_forward: bool = bool(self._bisect_seeded) and bool(
+            int(os.environ.get("CORESETS_LAZY_FORWARD", "1"))
+        )
+        # The seeded/lazy modes drive per-rank CONTROL FLOW (probe sequence, forward
+        # length) that must be lockstep — a rank with a divergent env (e.g. a wrapper
+        # exporting the flag on rank 0 only) would hang in a mismatched collective.
+        # Fail fast instead.
+        if dist.is_initialized():
+            flags = torch.tensor(
+                [self._bisect_seeded, int(self._lazy_forward)],
+                dtype=torch.long, device=device,
+            )
+            fmin, fmax = flags.clone(), flags.clone()
+            dist.all_reduce(fmin, op=dist.ReduceOp.MIN)
+            dist.all_reduce(fmax, op=dist.ReduceOp.MAX)
+            if not torch.equal(fmin, fmax):
+                raise RuntimeError(
+                    f"{self.DRIVER_NAME}: CORESETS_BISECT_SEED/CORESETS_LAZY_FORWARD "
+                    "differ across ranks — set them identically on every rank "
+                    "(they steer collective control flow)."
+                )
 
         # mid-layer checkpointing (sharded only; 0 = layer-end checkpoints only). Written at SAFE
         # points (between blocks / between fill picks), never inside a block's provisional forward.
@@ -335,38 +375,68 @@ class MultiGPUAccrete(ABC):
         added: List[int] = []
         step_seps: List[float] = [snap.sep]
         max_add = min(budget, len(desired))
-        pool_global = torch.tensor(desired, dtype=torch.long, device=self.device)
+        fwd = {
+            "pool": torch.tensor(desired, dtype=torch.long, device=self.device),
+            "exhausted": False,
+        }
 
-        with self.profiler("select_block_s"):
-            for _ in range(max_add):
-                best_val, new_idx, ctx = self._restricted_argmax(pool_global)
-                if best_val <= 0.0 or new_idx < 0:
-                    break
+        def forward_to(upto: int) -> int:
+            """Greedy forward pass up to ``upto`` picks; returns ``len(added)``.
 
-                self.sep = min(self.sep, best_val)
-                step_seps.append(self.sep)
-                added.append(new_idx)
-                sel_pos = len(self.selected)
-                self.selected.append(new_idx)
-                self.selected_set.add(new_idx)
-                self.trace("forward", sel_pos, new_idx, best_val, self.sep)
+            Each greedy pick depends only on the commits before it (prefix property),
+            so stopping early and extending later realizes the EXACT pick sequence of
+            one uninterrupted loop. The default path calls this once with ``max_add``
+            (the historical loop, byte-identical); the lazy path starts at seed+1 and
+            the bisect extends on demand. Every iteration runs collectives, and the
+            target ``upto`` derives from globally identical scalars on every rank, so
+            the loop stays lockstep."""
+            with self.profiler("select_block_s"):
+                while len(added) < min(upto, max_add) and not fwd["exhausted"]:
+                    best_val, new_idx, ctx = self._restricted_argmax(fwd["pool"])
+                    if best_val <= 0.0 or new_idx < 0:
+                        fwd["exhausted"] = True
+                        break
 
-                self._commit_argmax_winner(new_idx, sel_pos, ctx)
-                pool_global = pool_global[pool_global != new_idx]
+                    self.sep = min(self.sep, best_val)
+                    step_seps.append(self.sep)
+                    added.append(new_idx)
+                    sel_pos = len(self.selected)
+                    self.selected.append(new_idx)
+                    self.selected_set.add(new_idx)
+                    self.trace("forward", sel_pos, new_idx, best_val, self.sep)
+
+                    self._commit_argmax_winner(new_idx, sel_pos, ctx)
+                    fwd["pool"] = fwd["pool"][fwd["pool"] != new_idx]
+            return len(added)
+
+        # Lazy forward fires exactly when the bisect will gallop (same gate), so the
+        # binary-search fallback always sees the full forward it expects.
+        lazy = self._lazy_forward and self._bisect_seed <= self._GALLOP_MAX_SEED
+        forward_to(self._bisect_seed + 1 if lazy else max_add)
 
         if not added:
             return budget
 
         self.h_final.copy_(self.hausdorff_shard)
         self.v_final.copy_(self.voronoi_shard)
-        # build sel_start / added as device tensors once per block - they're
-        # sliced (not realloc'd) inside the bisect+reconstruct loop.
         sel_snap_t = torch.tensor(snap.selected, dtype=torch.long, device=self.device)
-        added_t = torch.tensor(added, dtype=torch.long, device=self.device)
+
+        extend_to = None
+        if lazy:
+
+            def extend_to(m: int) -> int:
+                """Materialise the greedy prefix up to ``m`` picks for the bisect."""
+                n_prev = len(added)
+                n_now = forward_to(m)
+                if n_now > n_prev:
+                    self.h_final.copy_(self.hausdorff_shard)
+                    self.v_final.copy_(self.voronoi_shard)
+                return n_now
 
         with self.profiler("bisect_s"):
             best_m = self._bisect(
-                snap, self.h_final, self.v_final, added, added_t, sel_snap_t, step_seps, budget
+                snap, self.h_final, self.v_final, added, sel_snap_t, step_seps, budget,
+                max_add, extend_to,
             )
 
         # rollback then replay best_m steps.
@@ -432,10 +502,11 @@ class MultiGPUAccrete(ABC):
         h_final: Tensor,
         v_final: Tensor,
         added: List[int],
-        added_t: Tensor,
         sel_start_t: Tensor,
         step_seps: List[float],
         total_budget: int,
+        max_add: int,
+        extend_to=None,
     ) -> int:
         """Find the maximum viable prefix length of ``added``.
 
@@ -448,30 +519,43 @@ class MultiGPUAccrete(ABC):
         cross-rank collective sequence are byte-for-byte the legacy ones; only the
         sequence of ``mid`` values visited differs.
 
-        ``added_t`` and ``sel_start_t`` are device int64 tensors built once
-        per block by the caller and sliced on every iter, replacing the
-        per-iter ``torch.tensor(...)`` allocations.
+        ``extend_to`` (lazy forward, gallop branch only): callable growing the greedy
+        forward to ``m`` picks, returning the achieved length. ``viable`` calls it when
+        probing past the materialised prefix; a probe past the forward's NATURAL end
+        (pool exhausted / no positive gain) is reported non-viable so the search stays
+        below — equivalent to searching ``[0, n_natural]``. Extension only APPENDS
+        greedy picks, so earlier probe results (and the memo) stay exact.
         """
         sim_X_sel = self.scratch.sim_X_sel
         sim_norms_sel = self.scratch.sim_norms_sel
-        n_added = int(added_t.shape[0])
 
-        prefix_indices = torch.cat((sel_start_t, added_t))
-        in_shard = (prefix_indices >= self.layout.shard_offset) & (
-            prefix_indices < self.layout.shard_offset + self.layout.N_shard
-        )
-        cumsum_padded = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.long, device=self.device),
-                torch.cumsum(in_shard.long(), dim=0),
+        # Per-prefix device tensors, rebuilt by ``refresh`` whenever the forward grows
+        # (a once-per-block cost on the default path, exactly as before).
+        state: dict = {}
+
+        def refresh() -> None:
+            n_added = len(added)
+            added_t = torch.tensor(added, dtype=torch.long, device=self.device)
+            prefix_indices = torch.cat((sel_start_t, added_t))
+            in_shard = (prefix_indices >= self.layout.shard_offset) & (
+                prefix_indices < self.layout.shard_offset + self.layout.N_shard
             )
-        )
-        prefix_count_local = cumsum_padded[
-            snap.n_selected : snap.n_selected + n_added + 1
-        ]
-        n_pos_arr = self.layout.N_shard - prefix_count_local
-        dist.all_reduce(n_pos_arr, op=dist.ReduceOp.SUM)
-        n_pos_global_cpu = n_pos_arr.cpu().tolist()
+            cumsum_padded = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.long, device=self.device),
+                    torch.cumsum(in_shard.long(), dim=0),
+                )
+            )
+            prefix_count_local = cumsum_padded[
+                snap.n_selected : snap.n_selected + n_added + 1
+            ]
+            n_pos_arr = self.layout.N_shard - prefix_count_local
+            dist.all_reduce(n_pos_arr, op=dist.ReduceOp.SUM)
+            state["n_added"] = n_added
+            state["added_t"] = added_t
+            state["n_pos_global_cpu"] = n_pos_arr.cpu().tolist()
+
+        refresh()
 
         # viability of a candidate prefix length ``mid`` — the per-probe work the
         # legacy binary search ran inline, lifted into a closure so both search modes
@@ -491,6 +575,13 @@ class MultiGPUAccrete(ABC):
             cached = memo.get(mid)
             if cached is not None:
                 return cached
+            if mid > state["n_added"]:
+                if extend_to is not None and extend_to(mid) > state["n_added"]:
+                    refresh()
+                if mid > state["n_added"]:
+                    # past the forward's natural end: no such prefix exists.
+                    memo[mid] = False
+                    return False
             sep_mid = step_seps[mid]
             points_left = total_budget - mid
             final_size = snap.n_selected + mid + points_left
@@ -500,7 +591,7 @@ class MultiGPUAccrete(ABC):
                 return True
 
             # Trivially-viable check: skip reconstruction entirely on this path.
-            n_pos_global = n_pos_global_cpu[mid]
+            n_pos_global = state["n_pos_global_cpu"][mid]
             if points_left >= n_pos_global:
                 memo[mid] = True
                 return True
@@ -515,7 +606,7 @@ class MultiGPUAccrete(ABC):
                 self.x_shard_view,
                 self.norms_shard_view,
                 sel_start_t,
-                added_t,
+                state["added_t"],
                 mid,
                 snap.n_selected,
                 self.layout.shard_offset,
@@ -546,9 +637,13 @@ class MultiGPUAccrete(ABC):
             # answer finds it in ~2 probes (measured 4.5x less simulated fill, 6.8x less
             # bisect wall-time). For a moderate/large prior prefix binary search already
             # reaches the boundary cheaply and galloping loses, so the guard routes there.
-            best = self._largest_true(viable, n_added, self._bisect_seed)
+            # With the lazy forward, gallop over the full potential range [0, max_add];
+            # ``viable`` materialises prefixes on demand and floors probes past the
+            # forward's natural end.
+            n_hi = max_add if extend_to is not None else state["n_added"]
+            best = self._largest_true(viable, n_hi, self._bisect_seed)
         else:
-            best = self._binary_search(viable, n_added)
+            best = self._binary_search(viable, state["n_added"])
         # carry the answer to seed the next block (also keeps the guard's seed current
         # when this block went through the binary branch).
         if self._bisect_seeded:
@@ -569,36 +664,57 @@ class MultiGPUAccrete(ABC):
                 high = mid - 1
         return best
 
-    @staticmethod
-    def _largest_true(predicate, n: int, seed: int) -> int:
+    @classmethod
+    def _largest_true(cls, predicate, n: int, seed: int) -> int:
         """Largest ``m`` in ``[0, n]`` with ``predicate(m)`` True, for a monotone
         non-increasing predicate (a True-prefix followed by a False-suffix).
 
-        Seeded galloping search: probe the seed, gallop outward to bracket the
-        True/False boundary, then binary-search the bracket. Probes
-        ``O(log|answer - seed|)`` values instead of ``O(log n)``, and stays biased
-        toward small ``m`` (where the simulator early-exits cheaply). For a monotone
-        predicate this returns the identical boundary a full ``[0, n]`` binary search
-        would (so the coreset is byte-identical); only float32 sim noise exactly at the
-        boundary can make the two disagree by one, both choices being sep>=cov-valid.
+        Seeded walk-then-gallop search: probe the seed, walk +-1 toward the boundary
+        for ``_GALLOP_LINEAR`` steps (the answer drifts 0..3 per block in production,
+        so the walk crosses it paying exactly ONE full-length non-viable sim), then
+        double the stride to bracket distant boundaries in O(log) probes, then
+        binary-search the bracket. For a monotone predicate this returns the identical
+        boundary a full ``[0, n]`` binary search would (so the coreset is
+        byte-identical); only float32 sim noise at the boundary can make the two
+        disagree (typically by one — every flipped probe widens the possible gap),
+        all candidate answers being sep>=cov-valid.
 
         Returns 0 when nothing is viable (the legacy bisect's floor: ``best`` started
         at 0 and was only ever raised by a viable probe)."""
         seed = max(0, min(int(seed), n))
-        if not predicate(seed):
-            lo, hi = -1, seed                 # virtual True at -1; known False at seed
-        else:
-            lo, step, probe, hi = seed, 1, seed + 1, None
+        if predicate(seed):
+            # walk/gallop UP from a viable seed until the first non-viable probe.
+            lo, hi = seed, None
+            step, taken = 1, 0
+            probe = seed + 1
             while probe <= n:
                 if predicate(probe):
                     lo = probe
-                    step *= 2
+                    taken += 1
+                    if taken >= cls._GALLOP_LINEAR:
+                        step *= 2
                     probe = lo + step
                 else:
                     hi = probe
                     break
             if hi is None:
                 hi = n + 1                    # virtual False just past the range
+        else:
+            # walk/gallop DOWN from a non-viable seed until the first viable probe.
+            lo, hi = None, seed
+            step, taken = 1, 0
+            probe = seed - 1
+            while probe >= 0:
+                if predicate(probe):
+                    lo = probe
+                    break
+                hi = probe
+                taken += 1
+                if taken >= cls._GALLOP_LINEAR:
+                    step *= 2
+                probe = hi - step
+            if lo is None:
+                lo = -1                       # virtual True below the range
         # invariant: predicate(lo) True (or lo == -1), predicate(hi) False (or hi past n)
         while hi - lo > 1:
             mid = (lo + hi) // 2
