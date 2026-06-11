@@ -61,7 +61,7 @@ class MultiGPUAccrete(ABC):
 
     DRIVER_NAME: str = "<unset>"
 
-    # Seeded-bisect tuning (rationale + measurements: ACCELERATE_BISECTION.md).
+    # Seeded-bisect tuning (rationale + measurements: mad-core/docs/project_memory/accrete_acceleration.md).
     # Walk only when the seed (expected kept prefix) is tiny — for larger prefixes
     # binary search reaches the boundary cheaper and bit-stably.
     _GALLOP_MAX_SEED: int = 32
@@ -148,7 +148,7 @@ class MultiGPUAccrete(ABC):
         self.selected_set: Set[int] = set()
         self.sep: float = float("inf")
 
-        # Opt-in bisect acceleration (design + measurements: ACCELERATE_BISECTION.md).
+        # Opt-in bisect acceleration (design + measurements: mad-core/docs/project_memory/accrete_acceleration.md).
         # All flags are read once; the DEFAULT (everything off) is byte-identical to
         # the historical output. The opt-in modes change only the order in which
         # candidate prefixes are probed, never the per-probe math: results are
@@ -630,7 +630,7 @@ class MultiGPUAccrete(ABC):
         if self._bisect_seeded and self._bisect_seed <= self._GALLOP_MAX_SEED:
             # Tiny-prefix regime: walk from the positional seed. (Keep-many blocks
             # stay on binary search via the guard — measured faster AND bit-stable
-            # at those boundaries; see ACCELERATE_BISECTION.md.)
+            # at those boundaries; see mad-core/docs/project_memory/accrete_acceleration.md.)
             high = max_add if extend_to is not None else prefix["n_added"]
             seed = max(0, min(int(self._bisect_seed), high))
 

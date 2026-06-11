@@ -11,7 +11,7 @@ Run on one GPU:                python examples/merge_example.py
 Multi-GPU / sharded variant:   examples/run_minimal.py  (mode "sharded")
 
 Production speed flags (opt-in; results stay valid sep>cov coresets, see
-ACCELERATE_BISECTION.md — 5x on the production merge):
+mad-core/docs/project_memory/accrete_acceleration.md — 5x on the production merge):
     export CORESETS_BISECT_SEED=1
     export CORESETS_FILL_CHUNK=256
 """
