@@ -363,6 +363,73 @@ class ShardedDriver(MultiGPUAccrete):
         )
         return bool(is_viable), int(steps_used)
 
+    def _lane_scratch(self, W: int):
+        """Lazy per-lane sim buffers (allocated only when CORESETS_BISECT_LANES is
+        active, so the default path's memory footprint is untouched). Lane 0 reuses
+        the sequential sim's scratch where shapes allow."""
+        cached = getattr(self, "_lanes_buf", None)
+        if cached is not None and cached["W"] >= W:
+            return cached
+        scratch = self.scratch
+        dev = self.device
+        stride = scratch.stride
+        world = self.layout.world_size
+        buf = {
+            "W": W,
+            "X_sel": [scratch.sim_X_sel]
+            + [torch.empty_like(scratch.sim_X_sel) for _ in range(W - 1)],
+            "norms_sel": [scratch.sim_norms_sel]
+            + [torch.empty_like(scratch.sim_norms_sel) for _ in range(W - 1)],
+            "dSL": [scratch.sim_dSL_quarter]
+            + [torch.empty_like(scratch.sim_dSL_quarter) for _ in range(W - 1)],
+            "h": [torch.empty_like(self.hausdorff_shard) for _ in range(W)],
+            "v": [torch.empty_like(self.voronoi_shard) for _ in range(W)],
+            "pack": torch.empty(W * stride, dtype=torch.float32, device=dev),
+            "gather": torch.empty(world * W * stride, dtype=torch.float32, device=dev),
+            "lane_gather": torch.empty((W, world * stride), dtype=torch.float32, device=dev),
+            "sep": torch.empty(W, dtype=torch.float32, device=dev),
+            "viable": torch.empty(W, dtype=torch.int32, device=dev),
+        }
+        self._lanes_buf = buf
+        return buf
+
+    def _simulate_lanes(self, probes: List[dict]) -> List[Tuple[bool, int]]:
+        """Run W probe sims as fused lanes (one X pass + one allgather per step).
+
+        ``probes[w]`` = dict(h, voronoi, sep, points_left, n_init) — exactly the
+        arguments the sequential ``_simulate`` would receive for that prefix; the
+        per-lane math (and therefore each verdict) is bit-identical to running
+        ``_simulate`` per probe. h/voronoi are consumed in place (they are the
+        bisect's per-probe reconstruct clones)."""
+        ext = get_ext()
+        scratch = self.scratch
+        layout = self.layout
+        W = len(probes)
+        buf = self._lane_scratch(W)
+
+        for w, pr in enumerate(probes):
+            n_init = pr["n_init"]
+            buf["h"][w].copy_(pr["h"])
+            buf["v"][w].copy_(pr["voronoi"])
+            buf["X_sel"][w][:n_init].copy_(self.X_sel[:n_init])
+            buf["norms_sel"][w][:n_init].copy_(self.norms_sel[:n_init])
+
+        out = ext.simulate_fps_voronoi_multi_sharded_lanes(
+            self.X_local, self.norms_local,
+            buf["h"][:W], buf["v"][:W], buf["X_sel"][:W], buf["norms_sel"][:W], buf["dSL"][:W],
+            scratch.block_vals, scratch.block_idxs, scratch.d_out_val, scratch.d_out_idx,
+            buf["pack"][: W * scratch.stride],
+            buf["gather"][: layout.world_size * W * scratch.stride],
+            buf["lane_gather"][:W],
+            buf["sep"][:W], buf["viable"][:W], scratch.sim_active_mask,
+            [float(pr["sep"]) for pr in probes],
+            [int(pr["points_left"]) for pr in probes],
+            [int(pr["n_init"]) for pr in probes],
+            int(layout.shard_offset), int(layout.N_shard), int(layout.world_size),
+            scratch.pg,
+        )
+        return [(bool(out[w]), int(out[W + w])) for w in range(W)]
+
     def _global_max_h(self, h_shard: Tensor) -> float:
         ext = get_ext()
         scratch = self.scratch

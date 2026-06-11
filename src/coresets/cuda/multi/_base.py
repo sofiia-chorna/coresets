@@ -188,13 +188,49 @@ class MultiGPUAccrete(ABC):
         self._lazy_forward: bool = bool(self._bisect_seeded) and bool(
             int(os.environ.get("CORESETS_LAZY_FORWARD", "1"))
         )
+        # POSITIONAL seeds (seeded mode). A layer's blocks are different REGIMES:
+        # position 0 (the fresh doubling block) keeps a large prefix that grows
+        # ~2.2-2.4x per layer (measured on madnext: 378 -> 828 -> 1994 -> 4505),
+        # while positions >= 1 keep tiny prefixes (6, 24, 7, 25). A single rolling
+        # seed is therefore always stale by one position — the very reason the old
+        # _GALLOP_MAX_SEED guard had to route large seeds to binary search. Keyed
+        # by position, the prior layer's same-position answer is an excellent
+        # predictor (x2 growth applied at position 0), so the walk can be used at
+        # EVERY block when seeded; the guard now only gates the lazy forward.
+        self._seed_by_pos: dict = {}
+        # Fused probe lanes (rides the seeded mode; CORESETS_BISECT_LANES, default 4,
+        # <2 disables). The walk probes W consecutive prefixes per block and each
+        # probe's sim is a bandwidth-bound scan of X (at production geometry the
+        # voronoi skip rarely fires), so running the W sims as LANES of one loop —
+        # one X pass + one allgather per step serving every lane — makes W probes
+        # cost ~1 sim. Per-lane math is bit-identical to the sequential sim, so the
+        # bisect answers (and the coreset) are unchanged; only wall-clock drops.
+        # Drivers without _simulate_lanes (replicated) silently run sequentially.
+        self._bisect_lanes: int = 0
+        if self._bisect_seeded:
+            self._bisect_lanes = max(
+                0, min(8, int(os.environ.get("CORESETS_BISECT_LANES", "4")))
+            )
+        # Lanes only pay off when the probe sims are LONG. The fused pass costs
+        # ~2.3x ONE full sim per step (instruction-issue bound at W=4: 4x the FMA
+        # core + 4 shuffle reductions per row — measured, bench/lanes_kernel_bench),
+        # while the sequential walk costs (sum of viable probes' early-exit prefixes
+        # + the one full-length certificate). So lanes win exactly where viable
+        # probes run a large fraction of the budget — the DEEP drift blocks
+        # (measured v1 k=11: -7% layer wall; the win grows with depth, and the real
+        # production merge runs ~9 layers deeper than the v1 test) — and lose at
+        # shallow/stable blocks where the walk is already at the certificate floor.
+        # Gate: prefetch only when the seed probe would simulate at least this many
+        # fill steps (default 768 = the proven-win region: fires at v1's k=11
+        # 1022-step blocks, not its k=10 510-step ones).
+        self._lanes_min_steps: int = int(os.environ.get("CORESETS_LANES_MIN_STEPS", "768"))
         # The seeded/lazy modes drive per-rank CONTROL FLOW (probe sequence, forward
         # length) that must be lockstep — a rank with a divergent env (e.g. a wrapper
         # exporting the flag on rank 0 only) would hang in a mismatched collective.
         # Fail fast instead.
         if dist.is_initialized():
             flags = torch.tensor(
-                [self._bisect_seeded, int(self._lazy_forward)],
+                [self._bisect_seeded, int(self._lazy_forward), self._bisect_lanes],
                 dtype=torch.long, device=device,
             )
             fmin, fmax = flags.clone(), flags.clone()
@@ -202,9 +238,9 @@ class MultiGPUAccrete(ABC):
             dist.all_reduce(fmax, op=dist.ReduceOp.MAX)
             if not torch.equal(fmin, fmax):
                 raise RuntimeError(
-                    f"{self.DRIVER_NAME}: CORESETS_BISECT_SEED/CORESETS_LAZY_FORWARD "
-                    "differ across ranks — set them identically on every rank "
-                    "(they steer collective control flow)."
+                    f"{self.DRIVER_NAME}: CORESETS_BISECT_SEED/CORESETS_LAZY_FORWARD/"
+                    "CORESETS_BISECT_LANES differ across ranks — set them identically "
+                    "on every rank (they steer collective control flow)."
                 )
 
         # mid-layer checkpointing (sharded only; 0 = layer-end checkpoints only). Written at SAFE
@@ -337,13 +373,13 @@ class MultiGPUAccrete(ABC):
         if budget <= 0:
             return
 
-        for block in self.nested_blocks[k - 1 :]:
+        for pos, block in enumerate(self.nested_blocks[k - 1 :]):
             if budget <= 0:
                 break
             desired = sorted(block - self.selected_set)
             if not desired:
                 continue
-            budget = self._do_block(desired, budget)
+            budget = self._do_block(desired, budget, pos)
             self._maybe_midlayer_ckpt(k)        # safe point: block committed (post-bisect)
 
         # fill remainder with unconstrained FPS.
@@ -367,10 +403,23 @@ class MultiGPUAccrete(ABC):
 
         self._post_layer_hook(k, target_size)
 
-    def _do_block(self, desired: List[int], budget: int) -> int:
+    def _do_block(self, desired: List[int], budget: int, block_pos: int = 0) -> int:
         """One nested-block: snapshot => forward => bisect => rollback => replay"""
         with self.profiler("snapshot_s"):
             snap = self._snapshot()
+
+        # Positional seed for this block (see __init__): same-position answer from
+        # the previous layer, x2 at position 0 (the fresh doubling block's measured
+        # growth). No history => 0. Derived from globally identical state on every
+        # rank, so the walk's probe sequence stays lockstep.
+        if self._bisect_seeded:
+            prev = self._seed_by_pos.get(block_pos)
+            if prev is None:
+                self._bisect_seed = 0
+            elif block_pos == 0:
+                self._bisect_seed = 2 * prev
+            else:
+                self._bisect_seed = prev
 
         added: List[int] = []
         step_seps: List[float] = [snap.sep]
@@ -438,6 +487,8 @@ class MultiGPUAccrete(ABC):
                 snap, self.h_final, self.v_final, added, sel_snap_t, step_seps, budget,
                 max_add, extend_to,
             )
+        if self._bisect_seeded:
+            self._seed_by_pos[block_pos] = best_m   # next layer's same-position seed
 
         # rollback then replay best_m steps.
         self.hausdorff_shard.copy_(snap.hausdorff)
@@ -571,29 +622,28 @@ class MultiGPUAccrete(ABC):
         # seeded search land on an adjacent best_m — see __init__.)
         memo: dict = {}
 
-        def viable(mid: int) -> bool:
-            cached = memo.get(mid)
-            if cached is not None:
-                return cached
+        def classify(mid: int):
+            """The pre-sim part of a probe: every short-circuit the legacy loop ran
+            before reaching ``_simulate``. Returns a decided ``bool``, or a probe
+            dict (h/voronoi/sep/points_left/n_init) when a fill sim is required.
+            Shared verbatim by the sequential ``viable`` and the lanes prefetch so
+            the two paths cannot drift."""
             if mid > state["n_added"]:
                 if extend_to is not None and extend_to(mid) > state["n_added"]:
                     refresh()
                 if mid > state["n_added"]:
                     # past the forward's natural end: no such prefix exists.
-                    memo[mid] = False
                     return False
             sep_mid = step_seps[mid]
             points_left = total_budget - mid
             final_size = snap.n_selected + mid + points_left
 
             if final_size >= self.layout.N_global:
-                memo[mid] = True
                 return True
 
             # Trivially-viable check: skip reconstruction entirely on this path.
             n_pos_global = state["n_pos_global_cpu"][mid]
             if points_left >= n_pos_global:
-                memo[mid] = True
                 return True
 
             h_mid, voronoi_mid = reconstruct_hausdorff_with_voronoi_multi(
@@ -615,39 +665,91 @@ class MultiGPUAccrete(ABC):
 
             if points_left == 0:
                 max_h_global = self._global_max_h(h_mid)
-                memo[mid] = sep_mid > max_h_global
-                return memo[mid]
+                return sep_mid > max_h_global
+
+            return {
+                "h": h_mid,
+                "voronoi": voronoi_mid,
+                "sep": sep_mid,
+                "points_left": points_left,
+                "n_init": snap.n_selected + mid,
+            }
+
+        def viable(mid: int) -> bool:
+            cached = memo.get(mid)
+            if cached is not None:
+                return cached
+            probe = classify(mid)
+            if isinstance(probe, bool):
+                memo[mid] = probe
+                return probe
 
             # stage prefix into sim scratch (sim writes positions [n_init, ...]).
-            n_init = snap.n_selected + mid
+            n_init = probe["n_init"]
             if n_init > 0:
                 sim_X_sel[:n_init].copy_(self.X_sel[:n_init])
                 sim_norms_sel[:n_init].copy_(self.norms_sel[:n_init])
 
             is_viable, _ = self._simulate(
-                h_mid, voronoi_mid, sep_mid, points_left, n_init, sim_X_sel, sim_norms_sel
+                probe["h"], probe["voronoi"], probe["sep"], probe["points_left"],
+                n_init, sim_X_sel, sim_norms_sel,
             )
             memo[mid] = bool(is_viable)
             return memo[mid]
 
         if self._bisect_seeded and self._bisect_seed <= self._GALLOP_MAX_SEED:
-            # Tiny-prefix regime (production's high-norm-outlier anchors, from_A 1..5):
-            # the legacy binary search wastes ~log2(n_added) full-length non-viable fill
-            # simulations descending to a tiny boundary; galloping from the stable prior
-            # answer finds it in ~2 probes (measured 4.5x less simulated fill, 6.8x less
-            # bisect wall-time). For a moderate/large prior prefix binary search already
-            # reaches the boundary cheaply and galloping loses, so the guard routes there.
-            # With the lazy forward, gallop over the full potential range [0, max_add];
+            # Walk from the POSITIONAL seed (see _do_block) when the kept prefix is
+            # tiny. The guard stays even with aligned seeds — measured (chain 6):
+            # walking a KEEP-MANY boundary pins every probe at the most expensive
+            # mid region (points_left ~ budget - best per probe, and viable probes
+            # there do not early-exit), costing 1.4x binary's geometric descent AND
+            # flickering from_A at the big boundary; binary keeps those blocks
+            # bit-stable. With positional seeds the guard now routes by REGIME
+            # (position 0's large prefix -> binary; the tiny-prefix positions that
+            # used to be mis-seeded by position 0's answer -> the cheap walk).
+            # With the lazy forward, walk over the full potential range [0, max_add];
             # ``viable`` materialises prefixes on demand and floors probes past the
             # forward's natural end.
             n_hi = max_add if extend_to is not None else state["n_added"]
+
+            # Lanes prefetch: the walk's first probes are the consecutive prefixes
+            # [seed, seed + W). Classify them up front and run every sim-requiring
+            # one as a fused lane — one X pass + one allgather per step serves all
+            # lanes, so W probes cost ~1 sim. Verdicts are bit-identical to the
+            # sequential sims (same kernels per lane), so the walk's answer — and
+            # the coreset — is unchanged; memo carries them into the search. All
+            # branching below derives from globally identical scalars, keeping the
+            # collective sequence lockstep across ranks.
+            lo = max(0, min(int(self._bisect_seed), n_hi))
+            # mid=0 is never probed by the walk (it can't move the floor), so the
+            # prefetch starts at 1 when the seed is 0.
+            start = lo if lo > 0 else 1
+            if (
+                self._bisect_lanes >= 2
+                and hasattr(self, "_simulate_lanes")
+                and total_budget - lo >= self._lanes_min_steps
+            ):
+                sim_probes, sim_mids = [], []
+                for mid in range(start, min(start + self._bisect_lanes, n_hi + 1)):
+                    if mid in memo:
+                        continue
+                    probe = classify(mid)
+                    if isinstance(probe, bool):
+                        memo[mid] = probe
+                    else:
+                        sim_probes.append(probe)
+                        sim_mids.append(mid)
+                if len(sim_probes) >= 2:
+                    for mid, (ok, _steps) in zip(
+                        sim_mids, self._simulate_lanes(sim_probes)
+                    ):
+                        memo[mid] = bool(ok)
+                # a single leftover sim falls through to the sequential viable()
+                # (same verdict either way).
+
             best = self._largest_true(viable, n_hi, self._bisect_seed)
         else:
             best = self._binary_search(viable, state["n_added"])
-        # carry the answer to seed the next block (also keeps the guard's seed current
-        # when this block went through the binary branch).
-        if self._bisect_seeded:
-            self._bisect_seed = best
         return best
 
     @staticmethod
@@ -680,9 +782,17 @@ class MultiGPUAccrete(ABC):
         all candidate answers being sep>=cov-valid.
 
         Returns 0 when nothing is viable (the legacy bisect's floor: ``best`` started
-        at 0 and was only ever raised by a viable probe)."""
+        at 0 and was only ever raised by a viable probe).
+
+        ``m = 0`` is never probed: the answer floors at 0 regardless of
+        ``predicate(0)`` (a True can't raise it, a False can't lower it), so its
+        full-length fill sim is pure waste — for a monotone predicate skipping it
+        returns the identical answer. This removes one of the two certificate sims
+        on every kept-nothing block (the dominant block type in the production
+        merge). Only a non-monotone flicker exactly at 0 (False at 0, True at 1)
+        changes the outcome — and only by RETAINING MORE anchors."""
         seed = max(0, min(int(seed), n))
-        if predicate(seed):
+        if seed == 0 or predicate(seed):
             # walk/gallop UP from a viable seed until the first non-viable probe.
             lo, hi = seed, None
             step, taken = 1, 0

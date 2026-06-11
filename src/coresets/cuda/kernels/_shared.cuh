@@ -42,6 +42,11 @@ static __device__ __forceinline__ float warp_dot(const scalar_t* __restrict__ ro
     float dot = 0.0f;
     if constexpr (std::is_same<scalar_t, float>::value) {
         if (D % 4 == 0) {
+            // NB: a dual-load unrolled variant of this loop was tried (2026-06-10)
+            // and REGRESSED this helper's main consumers by ~18% (3.70->4.38 ms at
+            // 10.6M x 256) even though the same pattern helps the W-lane fused
+            // kernel in multi.cu — don't re-apply it here without re-measuring via
+            // bench/lanes_kernel_bench.sh.
             const float4* rp4 = reinterpret_cast<const float4*>(row_ptr);
             const float4* xn4 = reinterpret_cast<const float4*>(x_new_smem);
             for (int i = lane; i < D / 4; i += 32) {
@@ -156,4 +161,23 @@ std::tuple<bool, int64_t> simulate_fps_voronoi_multi_sharded(
     torch::Tensor argmax_gather_buf, torch::Tensor dSL_quarter, torch::Tensor d_local_sep,
     torch::Tensor d_viable, torch::Tensor sim_active_mask, double sep, int64_t points_left,
     int64_t shard_offset, int64_t N_shard, int64_t world_size,
+    c10::intrusive_ptr<c10d::ProcessGroup> pg);
+
+void voronoi_update_lanes_once(torch::Tensor X, torch::Tensor norms,
+                               std::vector<torch::Tensor> h_lanes,
+                               std::vector<torch::Tensor> v_lanes,
+                               std::vector<torch::Tensor> x_news,
+                               std::vector<torch::Tensor> norm_news,
+                               std::vector<torch::Tensor> dSL_lanes,
+                               std::vector<int64_t> sel_idxs, int64_t tpb_in);
+
+std::vector<int64_t> simulate_fps_voronoi_multi_sharded_lanes(
+    torch::Tensor X_local, torch::Tensor norms_local, std::vector<torch::Tensor> h_lanes,
+    std::vector<torch::Tensor> v_lanes, std::vector<torch::Tensor> X_sel_lanes,
+    std::vector<torch::Tensor> norms_sel_lanes, std::vector<torch::Tensor> dSL_lanes,
+    torch::Tensor block_vals, torch::Tensor block_idxs, torch::Tensor d_out_val,
+    torch::Tensor d_out_idx, torch::Tensor pack_lanes, torch::Tensor gather_lanes,
+    torch::Tensor lane_gather, torch::Tensor d_local_sep, torch::Tensor d_viable,
+    torch::Tensor sim_active_mask, std::vector<double> seps, std::vector<int64_t> points_lefts,
+    std::vector<int64_t> n_inits, int64_t shard_offset, int64_t N_shard, int64_t world_size,
     c10::intrusive_ptr<c10d::ProcessGroup> pg);

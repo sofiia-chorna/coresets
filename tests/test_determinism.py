@@ -199,6 +199,13 @@ def run_sharded(args):
 
     if rank == 0:
         got = result.cpu().numpy()
+        if args.save:
+            np.save(args.save, got)
+            print(f"[sharded] saved result to {args.save}")
+        if not os.path.exists(args.ref):
+            print(f"[sharded] no reference at {args.ref} — save-only run.")
+            dist.destroy_process_group()
+            sys.exit(0)
         ref = np.load(args.ref)
         print(f"[sharded] shape={got.shape} dtype={got.dtype}  world_size={world_size}")
 
@@ -240,6 +247,13 @@ def main():
         default=None,
         help="if set, per-commit TSV trace written to this path "
         "(rank 0 only in multi/sharded mode)",
+    )
+    ap.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="sharded mode: rank 0 saves the result indices here; if --ref does not "
+        "exist the run is save-only (used by the lanes A/B smoke test)",
     )
     args = ap.parse_args()
 

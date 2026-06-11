@@ -124,4 +124,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("d_local_sep"), py::arg("d_viable"), py::arg("sim_active_mask"), py::arg("sep"),
           py::arg("points_left"), py::arg("shard_offset"), py::arg("N_shard"),
           py::arg("world_size"), py::arg("pg"));
+
+    m.def("voronoi_update_lanes_once", &voronoi_update_lanes_once,
+          "Bench/test-only: one fused W-lane hausdorff update launch.",
+          py::arg("X"), py::arg("norms"), py::arg("h_lanes"), py::arg("v_lanes"),
+          py::arg("x_news"), py::arg("norm_news"), py::arg("dSL_lanes"), py::arg("sel_idxs"),
+          py::arg("tpb") = 256);
+
+    m.def("simulate_fps_voronoi_multi_sharded_lanes", &simulate_fps_voronoi_multi_sharded_lanes,
+          "Fused W-lane sharded sim: runs W bisect-probe sims as lanes of one loop "
+          "so each step's X pass and allgather are shared. Per-lane math is bit-"
+          "identical to simulate_fps_voronoi_multi_sharded. Returns flat "
+          "[viable_0..viable_{W-1}, steps_0..steps_{W-1}].",
+          py::arg("X_local"), py::arg("norms_local"), py::arg("h_lanes"), py::arg("v_lanes"),
+          py::arg("X_sel_lanes"), py::arg("norms_sel_lanes"), py::arg("dSL_lanes"),
+          py::arg("block_vals"), py::arg("block_idxs"), py::arg("d_out_val"), py::arg("d_out_idx"),
+          py::arg("pack_lanes"), py::arg("gather_lanes"), py::arg("lane_gather"),
+          py::arg("d_local_sep"), py::arg("d_viable"), py::arg("sim_active_mask"), py::arg("seps"),
+          py::arg("points_lefts"), py::arg("n_inits"), py::arg("shard_offset"), py::arg("N_shard"),
+          py::arg("world_size"), py::arg("pg"));
 }

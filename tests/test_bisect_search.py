@@ -121,6 +121,19 @@ def test_walk_pays_one_false_probe_in_drift_regime():
                 f"seed={seed} answer={answer}: {n_false} False probes (probes={calls})")
 
 
+def test_walk_never_probes_zero():
+    """m=0 cannot move the floor (True can't raise the answer, False can't lower
+    it), so the walk must never spend a full-length certificate sim on it —
+    one of the two sims on every kept-nothing block (the production merge's
+    dominant block type)."""
+    for n in (0, 1, 5, 100):
+        for t in range(-1, n + 1):
+            calls = []
+            got = LT(_counting(t, n, calls), n, seed=0)
+            assert 0 not in calls, f"n={n} t={t}: probed m=0 (calls={calls})"
+            assert got == _legacy_binary(lambda m: m <= t, n)
+
+
 def test_gallop_guard_constant_present():
     g = MultiGPUAccrete._GALLOP_MAX_SEED
     assert isinstance(g, int) and g > 0
@@ -208,6 +221,7 @@ if __name__ == "__main__":
     test_largest_true_floors_at_zero_when_nothing_viable()
     test_gallop_cuts_probes_in_tiny_answer_regime()
     test_walk_pays_one_false_probe_in_drift_regime()
+    test_walk_never_probes_zero()
     test_gallop_guard_constant_present()
     test_lazy_extension_matches_full_forward()
     test_lazy_materializes_few_in_stable_regime()
