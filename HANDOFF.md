@@ -10,11 +10,18 @@ export CORESETS_FILL_CHUNK=256       # batched fill (256 == 1024, already satura
 # optional knobs (defaults are right): CORESETS_LAZY_FORWARD=1, CORESETS_BISECT_LANES=4,
 #   CORESETS_LANES_MIN_STEPS=768, CORESETS_LANES_MEM_GB=8
 ```
-- **Wall-time planning:** cost ~ linear in n_target. Measured: 19 s compute / 2048 picks
-  at 16 GPUs on the 170M pool => ~26 h at 16 GPUs for 10M (vs ~5.5 DAYS on the default
-  path), ~6.5 h at 64 GPUs. Use `--checkpoint-every` (mid-layer, sharded) and chunk the
-  run across jobs; resubmitting with the same out/ckpt dirs RESUMES automatically
-  (fingerprint-checked). `bench/rehearsal_run.sh` is the template (no work-dir wipe).
+- **Wall-time planning (measured, rehearsal max_k=16 on the real 170M pool, 16 GPUs):**
+  per-layer dt 41 / 70 / 167 / 382 / 1137 / 1478 s for k=11..16; full run ≈ 55 min for
+  65,536 picks ⇒ ~50 ms/pick average (NOT the 9 ms/pick of the shallow v1 test — deeper
+  hierarchies process more nested blocks per layer and keep bigger anchor prefixes, so
+  per-pick cost grows with max_k). Extrapolation to n_target=10M: ~5–8 days at 16 GPUs,
+  ~1.5–2 days at 64 — calibrate with the max_k=20 (1M) segment first. RUN IT STAGED:
+  the hierarchy is nested, so run to 1M (max_k=20), validate/release, then RESUME the
+  same checkpoint dir and extend toward 10M — the kill+resume drill (chain 8 + job
+  2517889) proved exact mid-layer resume works. **`--resume` MUST be in the production
+  launch command from day one** (no-op on a fresh dir; without it a requeued job
+  silently recomputes from scratch — this exact mistake was caught by the drill).
+  `bench/rehearsal_run.sh` is the launch template (no work-dir wipe, has --resume).
 - **Memory at 10M targets:** X_sel + sim_X_sel = ~20 GB/GPU at max_sel=10M (pre-existing);
   the lane scratch would add (W-1)x10 GB more, so it self-clamps to
   `CORESETS_LANES_MEM_GB` (default 8 => W=1..2 at 10M). Raise it on GPUs with headroom.

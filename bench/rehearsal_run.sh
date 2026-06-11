@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=accrete-rehearsal
 #SBATCH --account=aa002
-#SBATCH --partition=debug
+#SBATCH --partition=normal
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=400G
-#SBATCH --time=00:22:00
+#SBATCH --time=01:45:00
 #SBATCH --uenv=pytorch/v2.9.1:v2
 #SBATCH --view=default
 #SBATCH --output=/capstor/scratch/cscs/schorna/merge-datasets/coresets/logs/_rehearsal_%j.out
@@ -42,7 +42,7 @@ mkdir -p "$WORK/out" "$WORK/ckpt"        # NO rm -rf: resubmits resume from ckpt
 echo "############ REHEARSAL max_k=$MAX_K n_target=$N_TARGET world=$SLURM_NTASKS  $(date -Is) ############"
 srun -ul --ntasks=$SLURM_NTASKS --gpus-per-task=1 \
     "$VENV_PY" "$CORESETS/bench/v1_timed.py" \
-        --manifest "$MANIFEST" --max-k $MAX_K --n-target $N_TARGET --checkpoint-every 2000 \
+        --manifest "$MANIFEST" --max-k $MAX_K --n-target $N_TARGET --checkpoint-every 2000 --resume \
         --anchor-npy "$ANCHOR" --anchor-cids "$ANCHOR_CIDS" \
         --out-dir "$WORK/out" --checkpoint-dir "$WORK/ckpt"
 echo "############ rehearsal rc=$? done $(date -Is) ############"
