@@ -99,6 +99,26 @@ class ShardedDriver(MultiGPUAccrete):
         self.x_shard_view = X_local
         self.norms_shard_view = norms_local
 
+        # Memory-safe lane count: the lane scratch's dominant term is (W-1) extra
+        # copies of sim_X_sel = (max_sel, D) — ~10 GB each at a 10M-target run —
+        # so clamp W to a budget (CORESETS_LANES_MEM_GB, default 8). Computed from
+        # STATIC, globally identical sizes (max_sel, D, max shard size), so every
+        # rank derives the same W and the collective control flow stays lockstep.
+        if self._bisect_lanes >= 2:
+            budget = float(os.environ.get("CORESETS_LANES_MEM_GB", "8")) * (1 << 30)
+            n_shard_max = max(layout.sizes)
+            el = X_local.element_size()
+            per_extra_lane = max_sel * (dim * el + 8)          # X_sel + norms + dSL
+            per_lane_hv = n_shard_max * 12                     # h (f32) + v (i64)
+            w = self._bisect_lanes
+            while w > 1 and (w - 1) * per_extra_lane + w * per_lane_hv > budget:
+                w -= 1
+            if w != self._bisect_lanes and layout.rank == 0:
+                print(f"[{self.DRIVER_NAME}] CORESETS_BISECT_LANES {self._bisect_lanes}"
+                      f" -> {w} (lane scratch capped at {budget / (1 << 30):.0f} GiB;"
+                      " raise CORESETS_LANES_MEM_GB to override)", flush=True)
+            self._bisect_lanes = w
+
     # ----------------------------------------------------------------- phases
 
     def _seed(self, first: int) -> None:

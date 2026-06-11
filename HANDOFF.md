@@ -1,5 +1,35 @@
 # Handoff — accelerating the multi-GPU accrete bisect
 
+## PRODUCTION RUNBOOK — the 170M -> 677k-hierarchy merge, n_target up to 10M
+The use-case this branch was built for. Validated config (chain 8 = the readiness
+drill: kill+resume rehearsal at max_k=16 on the real pool):
+
+```
+export CORESETS_BISECT_SEED=1        # the whole opt-in stack (walk + lazy forward + lanes)
+export CORESETS_FILL_CHUNK=256       # batched fill (256 == 1024, already saturated)
+# optional knobs (defaults are right): CORESETS_LAZY_FORWARD=1, CORESETS_BISECT_LANES=4,
+#   CORESETS_LANES_MIN_STEPS=768, CORESETS_LANES_MEM_GB=8
+```
+- **Wall-time planning:** cost ~ linear in n_target. Measured: 19 s compute / 2048 picks
+  at 16 GPUs on the 170M pool => ~26 h at 16 GPUs for 10M (vs ~5.5 DAYS on the default
+  path), ~6.5 h at 64 GPUs. Use `--checkpoint-every` (mid-layer, sharded) and chunk the
+  run across jobs; resubmitting with the same out/ckpt dirs RESUMES automatically
+  (fingerprint-checked). `bench/rehearsal_run.sh` is the template (no work-dir wipe).
+- **Memory at 10M targets:** X_sel + sim_X_sel = ~20 GB/GPU at max_sel=10M (pre-existing);
+  the lane scratch would add (W-1)x10 GB more, so it self-clamps to
+  `CORESETS_LANES_MEM_GB` (default 8 => W=1..2 at 10M). Raise it on GPUs with headroom.
+- **Resume semantics (opt-in path):** the positional-seed dict is not checkpointed; on
+  resume, each block position's first bisect routes to exact binary search (the cold-
+  start default), then re-seeds. A resumed run is therefore VALID but not guaranteed
+  byte-equal to an uninterrupted one (same class as the documented boundary flicker).
+- **Acceptance criteria for a production merge** (byte-diff vs a default-path run is NOT
+  the right test at depth — flicker is expected and a default reference costs ~5 days):
+  (1) `check_invariant_global` clean at every layer (run log), (2) `from_A` per layer in
+  the expected envelope, (3) re-run determinism if needed (same config => same bytes),
+  (4) RELEASE GATE: `bench/f64_certificate.{py,sh}` on the final hierarchy — exact
+  f64 sep/cov per level (~hours single GPU at 170M x 10M; expect the deepest near-
+  duplicate levels to sit at the f32 noise floor, see the certificate finding below).
+
 **Branch:** `accelerate-bisect` (off `develop`). Review with `git diff develop accelerate-bisect`.
 Full rationale + all measurements: `ACCELERATE_BISECTION.md`.
 

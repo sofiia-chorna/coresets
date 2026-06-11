@@ -410,12 +410,17 @@ class MultiGPUAccrete(ABC):
 
         # Positional seed for this block (see __init__): same-position answer from
         # the previous layer, x2 at position 0 (the fresh doubling block's measured
-        # growth). No history => 0. Derived from globally identical state on every
-        # rank, so the walk's probe sequence stays lockstep.
+        # growth). NO HISTORY (first occurrence of this position, or a RESUMED run —
+        # the seed dict is not checkpointed) => route to binary search by pushing the
+        # seed past the gallop guard: binary is the exact cold-start search, costs
+        # the same as the walk on the tiny first-occurrence blocks, and avoids
+        # walking an unknown (possibly keep-many) boundary from 0 after a resume.
+        # Derived from globally identical state on every rank, so the probe
+        # sequence stays lockstep.
         if self._bisect_seeded:
             prev = self._seed_by_pos.get(block_pos)
             if prev is None:
-                self._bisect_seed = 0
+                self._bisect_seed = self._GALLOP_MAX_SEED + 1   # => binary
             elif block_pos == 0:
                 self._bisect_seed = 2 * prev
             else:
