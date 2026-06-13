@@ -375,9 +375,9 @@ def print_header(
     print(f"  shard sizes = {sizes}")
     print(
         f"{'k':<4} | {'size':<6} | {'in_Bk':>6} | {'from_A':>7} | {'from_C':>7} | "
-        f"{'sep':>9} | {'cov':>9} | {'rel_gap':>11}"
+        f"{'sep':>9} | {'cov':>9} | {'rel_gap':>11} | {'dt_s':>8}"
     )
-    print("-" * 79)
+    print("-" * 90)
 
 
 def print_level_row(
@@ -389,6 +389,7 @@ def print_level_row(
     sep_val: float,
     cov_val: float,
     rel_gap: float,
+    dt_s: float = float("nan"),
 ) -> None:
     sel_set = set(selected[:target_size])
     in_bk = len(sel_set & block_k)
@@ -397,5 +398,6 @@ def print_level_row(
     print(
         f"{k:<4} | {target_size:<6} | {in_bk:>6} | "
         f"{from_a:>7} | {target_size - from_a:>7} | "
-        f"{sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str}"
+        f"{sep_val:>9.5f} | {cov_val:>9.5f} | {rel_gap_str} | {dt_s:>8.2f}",
+        flush=True,
     )

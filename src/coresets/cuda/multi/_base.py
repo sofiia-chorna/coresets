@@ -10,6 +10,7 @@ the winner-rank slot for sharded) and is fed straight back into the commit.
 from __future__ import annotations
 
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Set, Tuple
@@ -326,6 +327,8 @@ class MultiGPUAccrete(ABC):
         if budget <= 0:
             return
 
+        t_layer = time.perf_counter()
+
         for pos, block in enumerate(self.nested_blocks[k - 1 :]):
             if budget <= 0:
                 break
@@ -352,6 +355,7 @@ class MultiGPUAccrete(ABC):
                 sep_val,
                 cov_val,
                 rel_gap,
+                dt_s=time.perf_counter() - t_layer,
             )
 
         self._post_layer_hook(k, target_size)
