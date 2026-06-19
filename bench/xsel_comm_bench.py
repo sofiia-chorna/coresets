@@ -42,7 +42,9 @@ def timeit(fn, reps=REPS):
 def main():
     rank = int(os.environ["RANK"]); world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
+    # --gpus-per-task=1 restricts each rank to ONE visible GPU (device 0); guard
+    # against an out-of-range local_rank (the device-count check the prod scripts use).
+    torch.cuda.set_device(local_rank if local_rank < torch.cuda.device_count() else 0)
     dist.init_process_group("nccl", rank=rank, world_size=world)
     dev = torch.device("cuda")
     warmup_fast_fps()
