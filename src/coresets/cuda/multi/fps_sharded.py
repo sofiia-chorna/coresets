@@ -175,9 +175,34 @@ def fps_sharded(
     d_out_val = torch.empty(1, dtype=torch.float32, device=device)
     d_out_idx = torch.empty(1, dtype=torch.int32, device=device)
 
-    dSL_quarter = torch.empty(n_to_select, dtype=torch.float32, device=device)
-    X_sel = torch.empty((n_to_select, dim), dtype=X_local.dtype, device=device)
-    norms_sel = torch.empty(n_to_select, dtype=torch.float32, device=device)
+    # ---- X_sel sharding (opt-in, CORESETS_FPS_SHARD_XSEL) -------------------
+    # Default: replicate X_sel (K, D) on every rank (historical, byte-identical).
+    # On: shard X_sel contiguously — rank r owns global centers [r*M, (r+1)*M);
+    # each rank computes dSL only for its block, then the small (K-float) dSL
+    # vector is all-gathered. Trades a 102 GB/GPU replicated array (the wall at
+    # K~90M) for a per-pick dSL all-gather. The dSL VALUES are bit-identical
+    # whether computed sharded or replicated (same kernel, same inputs), so the
+    # output ordering is byte-identical — validated against a replicated run.
+    shard_xsel = bool(int(os.environ.get("CORESETS_FPS_SHARD_XSEL", "0")))
+    if shard_xsel and resume_from is not None:
+        raise NotImplementedError(
+            "CORESETS_FPS_SHARD_XSEL does not yet support --resume (the rebuild "
+            "path still fills a replicated X_sel). Run from scratch, or unset it."
+        )
+    M_shard = (n_to_select + world_size - 1) // world_size if shard_xsel else 0
+
+    if shard_xsel:
+        # local shard (+1 slot to stage x_new for the per-block dSL kernel);
+        # dSL_gather (W*M >= K floats) is the all-gathered, v-ordered full dSL.
+        X_sel = torch.empty((M_shard + 1, dim), dtype=X_local.dtype, device=device)
+        norms_sel = torch.empty(M_shard + 1, dtype=torch.float32, device=device)
+        dSL_shard = torch.empty(M_shard, dtype=torch.float32, device=device)
+        dSL_gather = torch.empty(world_size * M_shard, dtype=torch.float32, device=device)
+        dSL_quarter = None
+    else:
+        dSL_quarter = torch.empty(n_to_select, dtype=torch.float32, device=device)
+        X_sel = torch.empty((n_to_select, dim), dtype=X_local.dtype, device=device)
+        norms_sel = torch.empty(n_to_select, dtype=torch.float32, device=device)
 
     hausdorff_shard = torch.full(
         (layout.N_shard,), float("inf"), dtype=torch.float32, device=device
@@ -245,29 +270,58 @@ def fps_sharded(
     ) -> None:
         """Commit using the row carried in ``argmax_gather_buf[winner_rank]``."""
         base = winner_rank * stride
-        X_sel[sel_pos].copy_(argmax_gather_buf[base + 3 : base + 3 + dim])
-        norms_sel[sel_pos] = argmax_gather_buf[base + 2]
-
         if rank == owner_rank:
             local_idx = layout.to_local(new_global_idx)
             hausdorff_shard[local_idx] = -1.0
             voronoi_shard[local_idx] = sel_pos
 
-        x_new = X_sel[sel_pos]
-        norm_new = norms_sel[sel_pos : sel_pos + 1]
+        if not shard_xsel:
+            X_sel[sel_pos].copy_(argmax_gather_buf[base + 3 : base + 3 + dim])
+            norms_sel[sel_pos] = argmax_gather_buf[base + 2]
+            x_new = X_sel[sel_pos]
+            norm_new = norms_sel[sel_pos : sel_pos + 1]
+            if sel_pos == 0:
+                ext.fps_update_cuda(
+                    X_local, norms_local, x_new,
+                    hausdorff_shard, voronoi_shard, norm_new, sel_pos,
+                )
+            else:
+                ext.compute_dSL_quarter_cuda(X_sel, norms_sel, dSL_quarter, sel_pos)
+                ext.voronoi_update_cuda(
+                    X_local, norms_local, x_new,
+                    dSL_quarter[:sel_pos],
+                    hausdorff_shard, voronoi_shard, norm_new, sel_pos,
+                )
+            return
+
+        # --- sharded X_sel: contiguous blocks, rank r owns centers [r*M, (r+1)*M).
+        # Stage x_new at local slot `count` (= sel_pos%M on the owner, so this IS
+        # the owner's permanent write; a transient slot on every other rank), so
+        # compute_dSL_quarter reads x_new from X_sel[count] with no kernel change.
+        count = max(0, min(sel_pos - rank * M_shard, M_shard))   # owned OLD centers in [0,sel_pos)
+        X_sel[count].copy_(argmax_gather_buf[base + 3 : base + 3 + dim])
+        norms_sel[count] = argmax_gather_buf[base + 2]
+        x_new = X_sel[count]
+        norm_new = norms_sel[count : count + 1]
 
         if sel_pos == 0:
+            # only rank 0 (owner of center 0) updates; x_new is the seed coords.
             ext.fps_update_cuda(
                 X_local, norms_local, x_new,
                 hausdorff_shard, voronoi_shard, norm_new, sel_pos,
             )
-        else:
-            ext.compute_dSL_quarter_cuda(X_sel, norms_sel, dSL_quarter, sel_pos)
-            ext.voronoi_update_cuda(
-                X_local, norms_local, x_new,
-                dSL_quarter[:sel_pos],
-                hausdorff_shard, voronoi_shard, norm_new, sel_pos,
-            )
+            return
+
+        # each rank computes dSL for its `count` owned old centers vs x_new,
+        # then all-gather assembles the full v-ordered dSL[0:sel_pos].
+        if count > 0:
+            ext.compute_dSL_quarter_cuda(X_sel, norms_sel, dSL_shard, count)
+        dist.all_gather_into_tensor(dSL_gather, dSL_shard)        # [W*M], v-ordered by block
+        ext.voronoi_update_cuda(
+            X_local, norms_local, x_new,
+            dSL_gather[:sel_pos],
+            hausdorff_shard, voronoi_shard, norm_new, sel_pos,
+        )
 
     # ------------------------------------------------------------ checkpoint cadence
 
