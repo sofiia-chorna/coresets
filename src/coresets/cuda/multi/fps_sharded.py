@@ -42,7 +42,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from ..extension import ensure_compiled, get_ext
-from ._shared import rebuild_selected_state
+from ._shared import rebuild_selected_state, rebuild_selected_state_sharded
 from .layout import ShardLayout
 
 
@@ -184,11 +184,6 @@ def fps_sharded(
     # whether computed sharded or replicated (same kernel, same inputs), so the
     # output ordering is byte-identical — validated against a replicated run.
     shard_xsel = bool(int(os.environ.get("CORESETS_FPS_SHARD_XSEL", "0")))
-    if shard_xsel and resume_from is not None:
-        raise NotImplementedError(
-            "CORESETS_FPS_SHARD_XSEL does not yet support --resume (the rebuild "
-            "path still fills a replicated X_sel). Run from scratch, or unset it."
-        )
     M_shard = (n_to_select + world_size - 1) // world_size if shard_xsel else 0
 
     if shard_xsel:
@@ -384,21 +379,37 @@ def fps_sharded(
             )
 
         t_resume = time.time()
-        _rebuild_state_from_selected(
-            selected_prev_np=selected_prev_np,
-            selected=selected,
-            X_local=X_local,
-            norms_local=norms_local,
-            X_sel=X_sel,
-            norms_sel=norms_sel,
-            hausdorff_shard=hausdorff_shard,
-            voronoi_shard=voronoi_shard,
-            layout=layout,
-            rank=rank,
-            world_size=world_size,
-            device=device,
-            verbose=verbose and rank == 0,
-        )
+        if shard_xsel:
+            rebuild_selected_state_sharded(
+                selected_prev_np=selected_prev_np,
+                X_local=X_local,
+                norms_local=norms_local,
+                X_sel_shard=X_sel,
+                norms_sel_shard=norms_sel,
+                hausdorff_shard=hausdorff_shard,
+                voronoi_shard=voronoi_shard,
+                layout=layout,
+                world_size=world_size,
+                device=device,
+                selected_out=selected,
+                verbose=verbose and rank == 0,
+            )
+        else:
+            _rebuild_state_from_selected(
+                selected_prev_np=selected_prev_np,
+                selected=selected,
+                X_local=X_local,
+                norms_local=norms_local,
+                X_sel=X_sel,
+                norms_sel=norms_sel,
+                hausdorff_shard=hausdorff_shard,
+                voronoi_shard=voronoi_shard,
+                layout=layout,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                verbose=verbose and rank == 0,
+            )
 
         # restore the prior epsilons if present
         eps_file = f"{resume_from}_k{k0_done:010d}_eps.npy"

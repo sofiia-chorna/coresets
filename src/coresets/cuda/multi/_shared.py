@@ -204,6 +204,88 @@ def reconstruct_hausdorff_with_voronoi_multi(
     return h_mid, voronoi_mid
 
 
+def rebuild_selected_state_sharded(
+    *,
+    selected_prev_np: np.ndarray,
+    X_local: Tensor,
+    norms_local: Tensor,
+    X_sel_shard: Tensor,
+    norms_sel_shard: Tensor,
+    hausdorff_shard: Tensor,
+    voronoi_shard: Tensor,
+    layout,
+    world_size: int,
+    device,
+    selected_out: Optional[Tensor] = None,
+    verbose: bool = False,
+) -> None:
+    """Resume rebuild for the ROUND-ROBIN sharded X_sel (CORESETS_FPS_SHARD_XSEL).
+
+    Same result as ``rebuild_selected_state`` but never materialises the full
+    ``K_prev x D`` selected matrix (the 102 GB wall at large K). Streams the
+    selected set in chunks: each chunk is gathered via all-reduce-sum, used to
+    (a) update ``hausdorff_shard``/``voronoi_shard`` and (b) scatter its
+    round-robin-owned centers (center ``j`` -> rank ``j%W``, slot ``j//W``) into
+    this rank's ``X_sel_shard``. Identical f32 expression order to the replicated
+    rebuild, so a resumed sharded state matches a resumed replicated state.
+    """
+    K_prev = int(selected_prev_np.shape[0])
+    dim = int(X_local.shape[1])
+    n_local = int(X_local.shape[0])
+    rank = layout.rank
+    W = world_size
+
+    if selected_out is not None:
+        selected_out[:K_prev] = torch.from_numpy(selected_prev_np).to(
+            device=device, dtype=torch.long)
+
+    offsets = np.asarray(layout.offsets, dtype=np.int64)
+    owners = np.searchsorted(offsets, selected_prev_np, side="right") - 1   # pool-owner per center
+
+    hausdorff_shard.fill_(float("inf"))
+    voronoi_shard.zero_()
+    Xl32 = X_local.to(torch.float32) if n_local > 0 else None
+    nl_col = norms_local.to(torch.float32).unsqueeze(1) if n_local > 0 else None
+
+    CHUNK = max(16, min(1024, (6 * 1024 ** 3) // max(n_local * 4, 1)))
+    for c0 in range(0, K_prev, CHUNK):
+        c1 = min(c0 + CHUNK, K_prev)
+        m = c1 - c0
+        # gather this chunk's coords (each rank contributes its pool-owned rows)
+        Xc = torch.zeros((m, dim), dtype=torch.float32, device=device)
+        nc = torch.zeros(m, dtype=torch.float32, device=device)
+        mine = np.where(owners[c0:c1] == rank)[0]
+        if mine.size > 0:
+            local_ix = torch.from_numpy(selected_prev_np[c0:c1][mine] - int(offsets[rank])).to(
+                device=device, dtype=torch.long)
+            mine_t = torch.from_numpy(mine).to(device)
+            Xc[mine_t] = X_local[local_ix].to(torch.float32)
+            nc[mine_t] = norms_local[local_ix].to(torch.float32)
+        dist.all_reduce(Xc, op=dist.ReduceOp.SUM)
+        dist.all_reduce(nc, op=dist.ReduceOp.SUM)
+        # (a) fold the chunk into the running min-distance (same formula as replicated)
+        if n_local > 0:
+            dists = nl_col + nc.unsqueeze(0) - 2.0 * (Xl32 @ Xc.T)
+            cmin, carg = dists.min(dim=1)
+            better = cmin < hausdorff_shard
+            hausdorff_shard.copy_(torch.where(better, cmin, hausdorff_shard))
+            voronoi_shard.copy_(torch.where(better, (carg + c0).to(torch.long), voronoi_shard))
+        # (b) scatter this chunk's round-robin-owned centers into the X_sel shard
+        js = torch.arange(c0, c1, device=device)
+        owned = js[(js % W) == rank]
+        if owned.numel() > 0:
+            X_sel_shard[owned // W] = Xc[owned - c0].to(X_sel_shard.dtype)
+            norms_sel_shard[owned // W] = nc[owned - c0]
+        if verbose and (c1 % (CHUNK * 16) == 0 or c1 == K_prev):
+            print(f"  rebuild(shard) chunk {c1:,}/{K_prev:,}", flush=True)
+    # selected rows in THIS pool shard never get re-picked
+    mine_all = np.where(owners == rank)[0]
+    if mine_all.size > 0 and n_local > 0:
+        local_ix_all = torch.from_numpy(selected_prev_np[mine_all] - int(offsets[rank])).to(
+            device=device, dtype=torch.long)
+        hausdorff_shard[local_ix_all] = -1.0
+
+
 def rebuild_selected_state(
     *,
     selected_prev_np: np.ndarray,
