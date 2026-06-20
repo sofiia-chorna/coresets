@@ -17,6 +17,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("norms"), py::arg("x_new"), py::arg("dSL_quarter"), py::arg("hausdorff"),
           py::arg("voronoi"), py::arg("norm_new_t"), py::arg("sel_idx"));
 
+    m.def("voronoi_update_interleaved_cuda", &voronoi_update_interleaved_cuda,
+          "Like voronoi_update_cuda but reads the bound from a round-robin all-gather "
+          "buffer at (v%world_size)*chunk + v/world_size (no de-interleave).",
+          py::arg("X"), py::arg("norms"), py::arg("x_new"), py::arg("dSL_quarter"),
+          py::arg("hausdorff"), py::arg("voronoi"), py::arg("norm_new_t"), py::arg("sel_idx"),
+          py::arg("world_size"), py::arg("chunk"));
+
     m.def("argmax_cuda", &argmax_cuda, "Two-phase argmax over Hausdorff distances", py::arg("h"),
           py::arg("block_vals"), py::arg("block_idxs"), py::arg("d_out_val"), py::arg("d_out_idx"),
           py::arg("N"));

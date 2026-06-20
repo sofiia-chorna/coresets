@@ -192,12 +192,19 @@ def fps_sharded(
     M_shard = (n_to_select + world_size - 1) // world_size if shard_xsel else 0
 
     if shard_xsel:
-        # local shard (+1 slot to stage x_new for the per-block dSL kernel);
-        # dSL_gather (W*M >= K floats) is the all-gathered, v-ordered full dSL.
+        # ROUND-ROBIN ownership: rank r owns centers {r, r+W, ...} at local slots
+        # 0,1,2,... So every rank holds ~sel_pos/W centers at all depths (balanced),
+        # and the per-pick all-gather is sized to the current ceil(sel_pos/W) — it
+        # SCALES with sel_pos instead of always moving the full K (the fixed-M cost).
+        # The all-gather lands interleaved (rank r's block = centers r, r+W, ...), so
+        # a precomputed permutation de-interleaves it back to v-order for voronoi.
         X_sel = torch.empty((M_shard + 1, dim), dtype=X_local.dtype, device=device)
         norms_sel = torch.empty(M_shard + 1, dtype=torch.float32, device=device)
         dSL_shard = torch.empty(M_shard, dtype=torch.float32, device=device)
         dSL_gather = torch.empty(world_size * M_shard, dtype=torch.float32, device=device)
+        # voronoi_update reads the bound straight from the interleaved all-gather
+        # buffer (kernel does the v -> (v%W)*chunk + v//W lookup), so no v-ordered
+        # de-interleave buffer/pass is needed.
         dSL_quarter = None
     else:
         dSL_quarter = torch.empty(n_to_select, dtype=torch.float32, device=device)
@@ -294,33 +301,36 @@ def fps_sharded(
                 )
             return
 
-        # --- sharded X_sel: contiguous blocks, rank r owns centers [r*M, (r+1)*M).
-        # Stage x_new at local slot `count` (= sel_pos%M on the owner, so this IS
-        # the owner's permanent write; a transient slot on every other rank), so
-        # compute_dSL_quarter reads x_new from X_sel[count] with no kernel change.
-        count = max(0, min(sel_pos - rank * M_shard, M_shard))   # owned OLD centers in [0,sel_pos)
+        # --- sharded X_sel: ROUND-ROBIN, rank r owns centers {r, r+W, ...}.
+        # `count` = this rank's owned OLD centers in [0, sel_pos). Staging x_new at
+        # local slot `count` is the owner's permanent write (its new center's slot
+        # IS count) and a transient slot on every other rank, so compute_dSL_quarter
+        # reads x_new from X_sel[count] with no kernel change.
+        W = world_size
+        count = sel_pos // W + (1 if rank < sel_pos % W else 0)
         X_sel[count].copy_(argmax_gather_buf[base + 3 : base + 3 + dim])
         norms_sel[count] = argmax_gather_buf[base + 2]
         x_new = X_sel[count]
         norm_new = norms_sel[count : count + 1]
 
         if sel_pos == 0:
-            # only rank 0 (owner of center 0) updates; x_new is the seed coords.
             ext.fps_update_cuda(
                 X_local, norms_local, x_new,
                 hausdorff_shard, voronoi_shard, norm_new, sel_pos,
             )
             return
 
-        # each rank computes dSL for its `count` owned old centers vs x_new,
-        # then all-gather assembles the full v-ordered dSL[0:sel_pos].
+        chunk = (sel_pos + W - 1) // W                # ceil(sel_pos/W) = max count
         if count > 0:
             ext.compute_dSL_quarter_cuda(X_sel, norms_sel, dSL_shard, count)
-        dist.all_gather_into_tensor(dSL_gather, dSL_shard)        # [W*M], v-ordered by block
-        ext.voronoi_update_cuda(
+        # all-gather chunk floats per rank (scales with sel_pos); rank r's block
+        # carries dSL for centers r, r+W, ... interleaved. The kernel reads each
+        # row's bound at (v%W)*chunk + v//W directly — no de-interleave pass.
+        g = dSL_gather[: W * chunk]
+        dist.all_gather_into_tensor(g, dSL_shard[:chunk])
+        ext.voronoi_update_interleaved_cuda(
             X_local, norms_local, x_new,
-            dSL_gather[:sel_pos],
-            hausdorff_shard, voronoi_shard, norm_new, sel_pos,
+            g, hausdorff_shard, voronoi_shard, norm_new, sel_pos, W, chunk,
         )
 
     # ------------------------------------------------------------ checkpoint cadence

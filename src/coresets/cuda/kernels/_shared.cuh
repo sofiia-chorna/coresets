@@ -76,6 +76,11 @@ void voronoi_update_cuda(torch::Tensor X, torch::Tensor norms, torch::Tensor x_n
                          torch::Tensor dSL_quarter, torch::Tensor hausdorff, torch::Tensor voronoi,
                          torch::Tensor norm_new_t, int64_t sel_idx);
 
+void voronoi_update_interleaved_cuda(torch::Tensor X, torch::Tensor norms, torch::Tensor x_new,
+                                     torch::Tensor dSL_quarter, torch::Tensor hausdorff,
+                                     torch::Tensor voronoi, torch::Tensor norm_new_t,
+                                     int64_t sel_idx, int64_t world_size, int64_t chunk);
+
 // argmax.cu
 void argmax_cuda(torch::Tensor h, torch::Tensor block_vals, torch::Tensor block_idxs,
                  torch::Tensor d_out_val, torch::Tensor d_out_idx, int64_t N);
