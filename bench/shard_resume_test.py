@@ -56,6 +56,10 @@ def main():
     C = run(X_local, K2, shard=False)                                    # replicated fresh
     run(X_local, K1, shard=False, ckpt=f"{tmp}_d")                       # replicated partial
     Dd = run(X_local, K2, shard=False, ckpt=f"{tmp}_d", resume=f"{tmp}_d")  # replicated resume
+    # CROSS-MODE: checkpoint written REPLICATED, resumed SHARDED (the "start small,
+    # turn sharding on to go bigger" pattern). Must equal the sharded resume B.
+    run(X_local, K1, shard=False, ckpt=f"{tmp}_e")                       # replicated partial
+    E = run(X_local, K2, shard=True, ckpt=f"{tmp}_e", resume=f"{tmp}_e")  # sharded resume of it
 
     if rank == 0:
         def cmp(a, b):
@@ -69,7 +73,8 @@ def main():
         print(f"  [info] sharded fresh    vs replicated fresh       : {cmp(A, C)}", flush=True)
         print(f"  [info] sharded resume   vs sharded fresh          : {cmp(B, A)}", flush=True)
         print(f"  [info] replicated resume vs replicated fresh      : {cmp(Dd, C)}", flush=True)
-        ok = np.array_equal(B, Dd)                       # sharding correctness
+        print(f"  [cross-mode] replicated-ckpt -> sharded-resume vs sharded-resume : {cmp(E, B)}", flush=True)
+        ok = np.array_equal(B, Dd) and np.array_equal(E, B)   # sharding + cross-mode correctness
         same_as_repl_resume = cmp(B, A) == cmp(Dd, C)    # the fresh-diff is pre-existing if equal
         print(f"  => {'PASS (sharded resume == replicated resume)' if ok else 'FAIL'}"
               f"{'  [resume!=fresh is pre-existing: same diff replicated]' if same_as_repl_resume else ''}",
