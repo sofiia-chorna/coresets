@@ -468,7 +468,23 @@ class ShardedDriver(MultiGPUAccrete):
     def _post_layer_hook(self, k: int, target_size: int) -> None:
         if self.checkpoint_path is not None and self.layout.rank == 0:
             _write_checkpoint(self.checkpoint_path, k, self.selected, target_size, self.sep, self.verbose)
+            self._dump_seeds()
         self._last_ckpt_n = len(self.selected)   # layer-end ckpt supersedes the rolling mid one
+
+    def _dump_seeds(self) -> None:
+        """Persist the per-block bisect seeds (rank 0) as an OPTIONAL ``{path}_seeds.npy`` sidecar,
+        so a resume restarts the seeded walk instead of a cold binary search. Absent/unreadable =>
+        resume falls back to cold-start, so this can never break an existing checkpoint."""
+        if self.checkpoint_path is None or self.layout.rank != 0 or not self._seed_by_pos:
+            return
+        # [pos, best_m, best_m_two_layers_ago]; -1 = no 2nd point yet (loose seed on resume).
+        arr = np.asarray([[p, self._seed_by_pos[p], self._seed_prev_by_pos.get(p, -1)]
+                          for p in self._seed_by_pos], dtype=np.int64)
+        seeds_file = f"{self.checkpoint_path}_seeds.npy"
+        tmp = seeds_file + ".tmp"
+        with open(tmp, "wb") as f:
+            np.save(f, arr, allow_pickle=False)
+        os.replace(tmp, seeds_file)
 
     def _write_midlayer_checkpoint(self, k: int) -> None:
         """Rolling mid-layer dump (rank 0): {path}_mid.npy + _mid_sep.npy, then _latest.txt =
@@ -491,6 +507,7 @@ class ShardedDriver(MultiGPUAccrete):
         with open(tmp, "w") as f:
             f.write(f"{k} {n}\n")
         os.replace(tmp, latest)
+        self._dump_seeds()
         if self.verbose:
             print(f"  [checkpoint] mid-layer k={k} n={n:,} => {mid_file}", flush=True)
 

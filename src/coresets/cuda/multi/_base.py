@@ -179,12 +179,22 @@ class MultiGPUAccrete(ABC):
         # Lanes only pay off on long sims (deep blocks); below this many fill steps
         # the sequential walk is already at the one-certificate floor.
         self._lanes_min_steps: int = int(os.environ.get("CORESETS_LANES_MIN_STEPS", "768"))
+        # Deep-block gallop: extend the seeded walk to pos>=1 nested blocks even when their
+        # kept prefix exceeds _GALLOP_MAX_SEED. Those blocks have a small, stable best_m that
+        # seed=prev predicts well, so the walk pins it in a few probes where binary wastes
+        # ~log2(range). pos=0 stays binary (large best_m, 2x-prev seed too loose). The walk
+        # returns the SAME best_m as binary (monotone predicate), so this only changes speed.
+        # Opt-in; default off => byte-identical.
+        self._gallop_deep: bool = bool(self._bisect_seeded) and bool(
+            int(os.environ.get("CORESETS_BISECT_GALLOP_DEEP", "0"))
+        )
 
         # The flags steer collective control flow; a rank with a divergent env
         # would hang in a mismatched collective. Fail fast instead.
         if dist.is_initialized():
             flags = torch.tensor(
-                [self._bisect_seeded, int(self._lazy_forward), self._bisect_lanes],
+                [self._bisect_seeded, int(self._lazy_forward), self._bisect_lanes,
+                 int(self._gallop_deep)],
                 dtype=torch.long, device=device,
             )
             fmin, fmax = flags.clone(), flags.clone()
@@ -201,6 +211,14 @@ class MultiGPUAccrete(ABC):
         # points (between blocks / between fill picks), never inside a block's provisional forward.
         self.checkpoint_every: int = 0
         self._last_ckpt_n: int = 0
+
+        # progress heartbeat (rank-0 prints only; no compute effect)
+        self._dbg_k: int = 0
+        self._dbg_blk: int = 0
+        self._dbg_nprobe: int = 0
+        self._has_seed: bool = False     # set per block: True when a positional seed exists
+        self._tight_seed: bool = False   # set per block: True when 2-layer history gives a tight seed
+        self._seed_prev_by_pos: dict = {}   # the best_m from TWO layers ago, per block position
 
         self.profiler = PhaseTimer(enabled=profile, on_cuda=on_cuda)
         self.trace = Tracer(trace_path if layout.rank == 0 else None)
@@ -294,6 +312,21 @@ class MultiGPUAccrete(ABC):
         self.selected_set = set(self.selected)
         self.sep = sep_prev
         self._last_ckpt_n = len(self.selected)
+        # Optional warm-start: restore per-block bisect seeds so the first resumed layer uses the
+        # seeded walk instead of a cold binary search. Missing/unreadable => cold-start (safe).
+        seeds_file = f"{prefix}_seeds.npy"
+        if os.path.exists(seeds_file):
+            try:
+                _s = np.load(seeds_file)
+                self._seed_by_pos = {int(r[0]): int(r[1]) for r in _s}
+                if _s.shape[1] >= 3:    # 2-layer history (older 2-col sidecars => loose seed only)
+                    self._seed_prev_by_pos = {int(r[0]): int(r[2]) for r in _s if int(r[2]) >= 0}
+                if self.verbose and self.layout.rank == 0:
+                    print(f"  [resume] restored {len(self._seed_by_pos)} bisect seed(s) "
+                          f"({len(self._seed_prev_by_pos)} with 2-layer history) -> warm-start", flush=True)
+            except Exception as _e:
+                if self.verbose and self.layout.rank == 0:
+                    print(f"  [resume] seeds sidecar unreadable ({_e}); cold-start binary search", flush=True)
         if self.verbose and self.layout.rank == 0:
             print(f"  [resume] restored {len(self.selected):,} centers "
                   f"({'mid-layer ' if len(toks) >= 2 else ''}k={k0}, sep={sep_prev:.6g}); "
@@ -328,6 +361,9 @@ class MultiGPUAccrete(ABC):
             return
 
         t_layer = time.perf_counter()
+        self._dbg_k = k
+        if self.verbose and self.layout.rank == 0:
+            print(f"  [layer] k={k} start: budget={budget:,}  n_selected={len(self.selected):,}", flush=True)
 
         for pos, block in enumerate(self.nested_blocks[k - 1 :]):
             if budget <= 0:
@@ -339,8 +375,10 @@ class MultiGPUAccrete(ABC):
             self._maybe_midlayer_ckpt(k)        # safe point: block committed (post-bisect)
 
         # fill remainder with unconstrained FPS.
+        t_fill = time.perf_counter()      # block/bisect above, fill below (boundaries sync on collectives)
         with self.profiler("fill_s"):
             budget = self._fill_many(budget, k)
+        fill_dt = time.perf_counter() - t_fill
 
         cov_sq, sep_val, cov_val, rel_gap = check_invariant_global(
             self.hausdorff_shard, self.sep, k, target_size, self.device, self.DRIVER_NAME
@@ -357,11 +395,19 @@ class MultiGPUAccrete(ABC):
                 rel_gap,
                 dt_s=time.perf_counter() - t_layer,
             )
+            # approx block/bisect-vs-fill split (diagnostic: where the per-layer cost lives)
+            print(f"  [time] k={k} block_bisect={t_fill - t_layer:8.1f}s  fill={fill_dt:8.1f}s",
+                  flush=True)
 
         self._post_layer_hook(k, target_size)
 
     def _do_block(self, desired: List[int], budget: int, block_pos: int = 0) -> int:
         """One nested-block: snapshot => forward => bisect => rollback => replay"""
+        self._dbg_blk = block_pos
+        self._dbg_nprobe = 0
+        if self.verbose and self.layout.rank == 0:
+            print(f"  [block] k={self._dbg_k} pos={block_pos}: bisect start "
+                  f"(desired={len(desired):,}, budget={budget:,})", flush=True)
         with self.profiler("snapshot_s"):
             snap = self._snapshot()
 
@@ -370,7 +416,18 @@ class MultiGPUAccrete(ABC):
         # or a resumed run — routes to binary search, the exact cold-start.
         if self._bisect_seeded:
             prev_best = self._seed_by_pos.get(block_pos)
-            if prev_best is None:
+            prev2 = self._seed_prev_by_pos.get(block_pos)
+            self._has_seed = prev_best is not None
+            # Tight seed: 2-layer history => geometric extrapolation best_m[k] ~ prev^2/prev2,
+            # accurate to a few %, so the gallop pins best_m in a handful of probes for EVERY
+            # block (incl. the large pos=0, where the loose 2x-prev seed would overshoot).
+            # Clamped to [prev/2, 2*prev] so a noisy ratio can never seed looser than 2x-prev.
+            self._tight_seed = (self._gallop_deep and prev_best is not None
+                                and prev2 is not None and prev2 > 0)
+            if self._tight_seed:
+                est = round(prev_best * prev_best / prev2)
+                self._bisect_seed = max(prev_best // 2, min(2 * prev_best, est))
+            elif prev_best is None:
                 self._bisect_seed = self._GALLOP_MAX_SEED + 1   # => binary search
             elif block_pos == 0:
                 self._bisect_seed = 2 * prev_best
@@ -409,11 +466,19 @@ class MultiGPUAccrete(ABC):
 
                     self._commit_argmax_winner(new_idx, sel_pos, ctx)
                     pool["candidates"] = pool["candidates"][pool["candidates"] != new_idx]
+                    if (self.verbose and self.layout.rank == 0
+                            and len(added) % 20000 == 0):
+                        print(f"    [forward] k={self._dbg_k} pos={self._dbg_blk} "
+                              f"{len(added):,}/{min(n_picks, max_add):,} provisional picks", flush=True)
             return len(added)
 
         # Lazy forward fires exactly when the bisect will walk (same gate), so the
         # binary-search branch always sees the full forward it expects.
-        lazy = self._lazy_forward and self._bisect_seed <= self._GALLOP_MAX_SEED
+        # pos>=1 only: the small/stable blocks where a seeded gallop beats binary. pos=0's best_m
+        # is large (~log2 probes are unavoidable for an exact search) and no seed is tight enough
+        # to help -- validation showed the gallop there ties or regresses, so pos=0 stays binary.
+        deep_walk = self._gallop_deep and self._has_seed and block_pos >= 1
+        lazy = self._lazy_forward and (self._bisect_seed <= self._GALLOP_MAX_SEED or deep_walk)
         forward_to(self._bisect_seed + 1 if lazy else max_add)
 
         if not added:
@@ -435,12 +500,19 @@ class MultiGPUAccrete(ABC):
                     self.v_final.copy_(self.voronoi_shard)
                 return n_now
 
+        t_bisect = time.perf_counter()
         with self.profiler("bisect_s"):
             best_m = self._bisect(
                 snap, self.h_final, self.v_final, added, sel_snap_t, step_seps, budget,
                 max_add, extend_to,
             )
+        if self.verbose and self.layout.rank == 0:
+            print(f"  [block] k={self._dbg_k} pos={block_pos}: best_m={best_m:,}  "
+                  f"(bisect {time.perf_counter() - t_bisect:.1f}s, {self._dbg_nprobe} sim-probes) "
+                  f"-> replay + fill", flush=True)
         if self._bisect_seeded:
+            if block_pos in self._seed_by_pos:                       # shift history: prev -> prev2
+                self._seed_prev_by_pos[block_pos] = self._seed_by_pos[block_pos]
             self._seed_by_pos[block_pos] = best_m   # next layer's same-position seed
 
         # rollback then replay best_m steps.
@@ -624,17 +696,24 @@ class MultiGPUAccrete(ABC):
                 sim_X_sel[:n_init].copy_(self.X_sel[:n_init])
                 sim_norms_sel[:n_init].copy_(self.norms_sel[:n_init])
 
+            t_probe = time.perf_counter()
             is_viable, _ = self._simulate(
                 probe["h"], probe["voronoi"], probe["sep"], probe["points_left"],
                 n_init, sim_X_sel, sim_norms_sel,
             )
             memo[mid] = bool(is_viable)
+            if self.verbose and self.layout.rank == 0:
+                self._dbg_nprobe += 1
+                print(f"    [bisect] k={self._dbg_k} pos={self._dbg_blk} probe#{self._dbg_nprobe} "
+                      f"mid={mid:,} sim_fill={probe['points_left']:,} -> viable={memo[mid]} "
+                      f"({time.perf_counter() - t_probe:.1f}s)", flush=True)
             return memo[mid]
 
-        if self._bisect_seeded and self._bisect_seed <= self._GALLOP_MAX_SEED:
-            # Tiny-prefix regime: walk from the positional seed. (Keep-many blocks
-            # stay on binary search via the guard — measured faster AND bit-stable
-            # at those boundaries; see mad-core/docs/project_memory/accrete_acceleration.md.)
+        deep_walk = self._gallop_deep and self._has_seed and self._dbg_blk >= 1   # pos>=1 only (see _do_block)
+        if self._bisect_seeded and (self._bisect_seed <= self._GALLOP_MAX_SEED or deep_walk):
+            # Seeded walk from the positional seed. Tiny-prefix blocks (seed<=32) always walk;
+            # with gallop_deep, pos>=1 blocks also walk (small/stable best_m, seed=prev is a
+            # good predictor). pos=0 keeps binary (large best_m, 2x-prev seed too loose).
             high = max_add if extend_to is not None else prefix["n_added"]
             seed = max(0, min(int(self._bisect_seed), high))
 

@@ -26,7 +26,7 @@ PROD=/capstor/store/cscs/swissai/aa002/mad-core
 MANIFEST=$RUN/manifest.txt
 ANCHOR_FEATS=$PROD/accrete/mad_coreset/anchor_features.parquet
 SCALER=$PROD/mad1.5/scaler.pkl
-WORK=$CORESETS/logs/fillrate
+WORK=$CORESETS/logs/fillrate_w${SLURM_NTASKS}   # per-world: lets node-count variants run concurrently
 N_TARGET=${1:-262144}
 
 VENV_PY=$MAD_CORE/venv-phace/bin/python
@@ -39,7 +39,7 @@ export TORCH_CUDA_ARCH_LIST=9.0
 export CORESETS_FILL_CHUNK=256            # the production fill batching
 unset CORESETS_BISECT_SEED                # irrelevant here (no bisect); keep default
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=29700
+export MASTER_PORT=$((29700 + SLURM_JOB_ID % 1000))   # per-job: avoid clashes across concurrent variants
 
 rm -rf "$WORK"; mkdir -p "$WORK/out" "$WORK/ckpt"
 echo "############ FILL-RATE PROBE  n_target=$N_TARGET world=$SLURM_NTASKS  $(date -Is) ############"
