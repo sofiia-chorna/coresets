@@ -247,7 +247,13 @@ def rebuild_selected_state_sharded(
     Xl32 = X_local.to(torch.float32) if n_local > 0 else None
     nl_col = norms_local.to(torch.float32).unsqueeze(1) if n_local > 0 else None
 
-    CHUNK = max(16, min(1024, (6 * 1024 ** 3) // max(n_local * 4, 1)))
+    # CHUNK MUST be identical on every rank: the in-loop all_reduce below depends on it for
+    # BOTH message size (Xc is (CHUNK, dim)) and trip count (ceil(K_prev/CHUNK)). A per-rank
+    # CHUNK from uneven n_local desyncs the collectives -> NCCL deadlock at the first chunk.
+    # layout.sizes is globally consistent (all-reduced in fps_sharded); size by the global max
+    # so every rank's dists tile (n_local*CHUNK*4 <= n_max*CHUNK*4) stays within the 6 GiB budget.
+    n_max = max(int(s) for s in layout.sizes)
+    CHUNK = max(16, min(1024, (6 * 1024 ** 3) // max(n_max * 4, 1)))
     for c0 in range(0, K_prev, CHUNK):
         c1 = min(c0 + CHUNK, K_prev)
         m = c1 - c0
