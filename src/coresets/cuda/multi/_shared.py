@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
@@ -423,6 +424,9 @@ def check_invariant_global(
     (well below float32 noise; the f64 verifier is authoritative).
     """
     GROSS_REL = 1e-3
+    # anchor over-representation relaxes the gate to sep >= beta*cov, so the run's sep settles near
+    # beta*cov -> widen the gross-violation floor by beta^2 (1.0 = off, unchanged for normal runs).
+    relax = float(os.environ.get("CORESETS_ANCHOR_COV_RELAX", "1.0"))
 
     # Exact-duplicate rows make the true separation 0, and float32 distance
     # arithmetic (||x||^2+||y||^2-2x.y) can leave sep_sq a hair NEGATIVE.
@@ -441,7 +445,7 @@ def check_invariant_global(
     cov_val = math.sqrt(cov_sq)
     rel_gap = (sep_sq / cov_sq - 1.0) if (cov_sq > 0 and math.isfinite(sep_sq)) else float("inf")
 
-    if math.isfinite(sep_sq) and sep_sq < cov_sq * (1.0 - GROSS_REL):
+    if math.isfinite(sep_sq) and sep_sq < cov_sq * relax * relax * (1.0 - GROSS_REL):
         raise RuntimeError(
             f"{name}: sep > cov violated at k={k} (size={target_size}): "
             f"sep={sep_val:.8e}, cov={cov_val:.8e}, rel_gap={rel_gap:.3e}. "

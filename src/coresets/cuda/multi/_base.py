@@ -159,6 +159,10 @@ class MultiGPUAccrete(ABC):
         self._bisect_seeded: int = int(os.environ.get("CORESETS_BISECT_SEED", "0"))
         # Seed for the current block's walk; assigned per block in _do_block.
         self._bisect_seed: int = 0
+        # Anchor over-representation: relax the Gonzalez gate for the ANCHOR block to sep >= beta*cov
+        # (beta<1 admits anchor points up to a factor inside the covering radius => keeps more of the
+        # curated anchor at the cost of coverage-optimality). 1.0 = off = byte-identical to before.
+        self._anchor_cov_relax: float = float(os.environ.get("CORESETS_ANCHOR_COV_RELAX", "1.0"))
         # Lazy forward: materialise only seed+1 greedy picks, extend on demand
         # (greedy picks depend only on the commits before them, so stopping early
         # and extending later realises the exact uninterrupted pick sequence).
@@ -641,7 +645,10 @@ class MultiGPUAccrete(ABC):
                 if mid > prefix["n_added"]:
                     # past the forward's natural end: no such prefix exists.
                     return False
-            sep_mid = step_seps[mid]
+            # relax the gate for the anchor block: treat the prefix as sep_mid/beta vs cov, i.e.
+            # admit it whenever its true separation >= beta*cov (beta<1 keeps more anchor). The
+            # ACTUAL sep (step_seps) is untouched -- only this viability threshold is inflated.
+            sep_mid = step_seps[mid] / self._anchor_cov_relax
             points_left = total_budget - mid
             final_size = snap.n_selected + mid + points_left
 
