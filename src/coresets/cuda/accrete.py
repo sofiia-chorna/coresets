@@ -1,5 +1,3 @@
-"""Single-GPU FPS-accretion. Public entry point for the production CUDA path."""
-
 from __future__ import annotations
 
 import time
@@ -23,6 +21,8 @@ from ._internal import (
 from .extension import ensure_compiled, get_ext
 
 
+# returns 2 to the max_k int64 indices into the concatenation of anchor and candidates
+# entries below n_anchor came from the anchor, max_k is derived from free memory if None
 def accrete(
     X_anchor: Tensor,
     X_candidates: Tensor,
@@ -33,61 +33,49 @@ def accrete(
     profile: bool = False,
     trace_path: Optional[str] = None,
 ) -> Tensor:
-    """Single-GPU FPS-accretion coreset.
-
-    Args:
-        X_anchor: ``(n_anchor, D)`` float CUDA. The first ``2**k`` entries of
-            ``anchor_order`` form the anchor block at level k.
-        X_candidates: ``(n_cand, D)`` float CUDA candidates. Pass ``(0, D)`` if
-            none.
-        anchor_order: ``(n_anchor,)`` int64 - anchor FPS hierarchy.
-        max_k: final coreset size = ``2 ** max_k``. Auto-derived from free
-            memory if ``None`` - pin in production.
-        verbose: per-level progress print.
-        profile: phase-level timing breakdown at end of run.
-        trace_path: diagnostic trace file (used by determinism tests).
-
-    Returns ``(2 ** max_k,)`` int64 indices into ``cat([X_anchor, X_candidates])``.
-    Entries < ``n_anchor`` came from the anchor.
-    """
     ensure_compiled()
     ext = get_ext()
 
     n_anchor, n_cand = X_anchor.shape[0], X_candidates.shape[0]
+
     if n_anchor == 0:
         raise ValueError("X_anchor is empty - need at least one anchor point.")
+
     if n_cand > 0 and X_anchor.shape[1] != X_candidates.shape[1]:
         raise ValueError(
             f"feature-dim mismatch: X_anchor={X_anchor.shape[1]}, "
             f"X_candidates={X_candidates.shape[1]}"
         )
 
-    # combine anchor + candidates into one global matrix; idx < n_anchor came from anchor.
+    # combine anchor and candidates into one global matrix
     n_total = n_anchor + n_cand
     dim = X_anchor.shape[1]
     X = torch.cat([X_anchor, X_candidates], dim=0) if n_cand > 0 else X_anchor
 
-    # C2: norms always float32 even if X is half - accumulator headroom.
+    # norms stay float32 even if X is half, accumulator headroom
     norms = (X * X).sum(dim=1).to(torch.float32)
 
     max_k, max_sel = resolve_max_k(max_k, n_total, dim, X.element_size(), X.device)
 
-    # nested anchor blocks: B_k = first 2^k anchors. accretion targets B_k at level k.
+    # nested anchor blocks, block k holds the first 2 to the k anchors
     anchor_indices = anchor_order.tolist()
     nested_blocks: List[Set[int]] = [
         set(anchor_indices[: min(2**i, n_anchor)]) for i in range(1, max_k + 1)
     ]
 
-    # state carried forward across levels - no per-level replay.
-    hausdorff = torch.full((n_total,), float("inf"), dtype=torch.float32, device=X.device)
+    # state carried forward across levels, no per level replay
+    hausdorff = torch.full(
+        (n_total,),
+        float("inf"),
+        dtype=torch.float32,
+        device=X.device,
+    )
     voronoi = torch.zeros(n_total, dtype=torch.long, device=X.device)
     X_sel = torch.empty((max_sel, dim), dtype=X.dtype, device=X.device)
     norms_sel = torch.empty(max_sel, dtype=torch.float32, device=X.device)
     scratch = Scratch.alloc(max_sel, dim, X.dtype, X.device, ext.MAX_ARGMAX_BLOCKS)
 
-    # persistent snapshot buffers: pre-block (h/v_snap) and post-forward (h/v_final).
-    # reused via copy_() each block - avoids reallocating four (n_total,) tensors per
-    # bisect cycle
+    # persistent snapshot buffers reused with copy_ each block
     h_snap = torch.empty_like(hausdorff)
     v_snap = torch.empty_like(voronoi)
     h_final = torch.empty_like(hausdorff)
@@ -96,15 +84,23 @@ def accrete(
     trace = Tracer(trace_path)
     profiler = PhaseTimer(enabled=profile, on_cuda=X.is_cuda)
 
-    # seed with the first anchor -> fixes the orientation of the FPS hierarchy.
+    # seed with the first anchor, this fixes the orientation of the fps hierarchy
     first = anchor_indices[0]
     selected: List[int] = [first]
     selected_set: Set[int] = {first}
     sep = float("inf")
+
     voronoi_step(
-        X, norms, hausdorff, voronoi, X_sel, norms_sel,
-        scratch.dSL_quarter, scratch.d_out_idx,
-        first, 0,
+        X,
+        norms,
+        hausdorff,
+        voronoi,
+        X_sel,
+        norms_sel,
+        scratch.dSL_quarter,
+        scratch.d_out_idx,
+        first,
+        0,
     )
 
     if verbose:
@@ -113,23 +109,26 @@ def accrete(
     for k in range(1, max_k + 1):
         target_size = 2**k
         budget = target_size - len(selected)
+
         if budget <= 0:
             continue
 
         if X.is_cuda:
             torch.cuda.synchronize()
+
         t_level = time.perf_counter()
 
-        # try to satisfy budget from each higher-level block in turn (B_k, B_{k+1}, ...).
-        # this preserves anchor-hierarchy at every level k where 2^k <= n_anchor.
+        # satisfy the budget from each higher level block in turn so the anchor hierarchy is kept
         for block in nested_blocks[k - 1 :]:
             if budget <= 0:
                 break
+
             desired = sorted(block - selected_set)
+
             if not desired:
                 continue
 
-            # snapshot pre-block state - rolled back after the bisect picks best_m.
+            # snapshot the pre block state, rolled back after the bisect picks best_m
             with profiler("snapshot_s"):
                 h_snap.copy_(hausdorff)
                 v_snap.copy_(voronoi)
@@ -137,30 +136,55 @@ def accrete(
                 n_snap = len(selected)
                 sel_snap = list(selected)
 
-            # greedy forward FPS over the desired pool, recording sep per step.
+            # greedy forward fps over the desired pool, recording sep per step
             added, step_seps = select_block_forward(
-                X, norms, hausdorff, voronoi, X_sel, norms_sel, scratch,
-                desired, budget, selected, selected_set, sep, sep_snap, trace, profiler,
+                X,
+                norms,
+                hausdorff,
+                voronoi,
+                X_sel,
+                norms_sel,
+                scratch,
+                desired,
+                budget,
+                selected,
+                selected_set,
+                sep,
+                sep_snap,
+                trace,
+                profiler,
             )
+
             if not added:
                 continue
+
             sep = step_seps[-1]
 
-            # bisect: largest m for which keeping ``added[:m]`` still admits
-            # a viable FPS completion (sep > cov throughout).
+            # bisect for the largest prefix of added that still admits a viable fps completion
             h_final.copy_(hausdorff)
             v_final.copy_(voronoi)
-            # build sel_start / added as device tensors once per block - they're
-            # sliced (not realloc'd) inside the bisect+reconstruct loop
+
+            # device tensors built once per block and sliced inside the bisect loop
             sel_snap_t = torch.tensor(sel_snap, dtype=torch.long, device=X.device)
             added_t = torch.tensor(added, dtype=torch.long, device=X.device)
+
             with profiler("bisect_s"):
                 best_m = bisect_voronoi_fast(
-                    X, norms, h_snap, h_final, v_final, v_snap,
-                    sel_snap_t, added_t, step_seps, budget, n_snap, scratch,
+                    X,
+                    norms,
+                    h_snap,
+                    h_final,
+                    v_final,
+                    v_snap,
+                    sel_snap_t,
+                    added_t,
+                    step_seps,
+                    budget,
+                    n_snap,
+                    scratch,
                 )
 
-            # rollback to snapshot, then replay only the best_m steps that survived bisect.
+            # roll back to the snapshot, then replay only the best_m steps that survived
             hausdorff.copy_(h_snap)
             voronoi.copy_(v_snap)
             selected = list(sel_snap)
@@ -175,18 +199,24 @@ def accrete(
                     selected_set.add(new_idx)
                     sep = step_seps[j + 1]
                     trace("replay", sel_pos, new_idx, sep, sep)
+
                     with profiler("voronoi_step_s"):
                         voronoi_step(
-                            X, norms, hausdorff, voronoi, X_sel, norms_sel,
-                            scratch.dSL_quarter, scratch.d_out_idx,
-                            new_idx, sel_pos,
+                            X,
+                            norms,
+                            hausdorff,
+                            voronoi,
+                            X_sel,
+                            norms_sel,
+                            scratch.dSL_quarter,
+                            scratch.d_out_idx,
+                            new_idx,
+                            sel_pos,
                         )
 
             budget -= best_m
 
-        # fill remainder with unconstrained FPS over the whole matrix.
-        # uses torch.max here (not the custom argmax kernel) - the small driver
-        # overhead is negligible vs voronoi_step's inner kernels.
+        # fill the remainder with unconstrained fps over the whole matrix
         with profiler("fill_s"):
             while budget > 0:
                 best_val_t, best_idx_t = torch.max(hausdorff, dim=0)
@@ -197,27 +227,46 @@ def accrete(
                 selected.append(new_idx)
                 selected_set.add(new_idx)
                 trace("fill", sel_pos, new_idx, best_val, sep)
+
                 with profiler("voronoi_step_s"):
                     voronoi_step(
-                        X, norms, hausdorff, voronoi, X_sel, norms_sel,
-                        scratch.dSL_quarter, scratch.d_out_idx,
-                        new_idx, sel_pos,
+                        X,
+                        norms,
+                        hausdorff,
+                        voronoi,
+                        X_sel,
+                        norms_sel,
+                        scratch.dSL_quarter,
+                        scratch.d_out_idx,
+                        new_idx,
+                        sel_pos,
                     )
+
                 budget -= 1
 
         if X.is_cuda:
             torch.cuda.synchronize()
+
         level_secs = time.perf_counter() - t_level
 
         cov_sq, sep_val, cov_val, rel_gap = check_invariant(hausdorff, sep, k, target_size)
+
         if verbose:
             print_level_row(
-                k, target_size, selected, nested_blocks[k - 1], n_anchor,
-                level_secs, sep_val, cov_val, rel_gap,
+                k,
+                target_size,
+                selected,
+                nested_blocks[k - 1],
+                n_anchor,
+                level_secs,
+                sep_val,
+                cov_val,
+                rel_gap,
             )
 
     if profile:
         profiler.report("accrete phases")
+
     trace.close()
 
     return torch.tensor(selected, dtype=torch.long, device=X.device)

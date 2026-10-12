@@ -208,3 +208,6 @@ __marimo__/
 *.out
 
 logs/
+
+# example / run outputs
+results/

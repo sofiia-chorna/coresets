@@ -1,5 +1,3 @@
-"""Voronoi-accelerated bisect over a greedily-selected FPS prefix"""
-
 from __future__ import annotations
 
 from typing import List
@@ -12,6 +10,8 @@ from .reconstruct import reconstruct_hausdorff_with_voronoi
 from .scratch import Scratch
 
 
+# binary search for the longest viable prefix of added, returns its length
+# sel_start_t and added_t are device int64 tensors sliced on every iteration
 def bisect_voronoi_fast(
     X: Tensor,
     norms: Tensor,
@@ -26,12 +26,6 @@ def bisect_voronoi_fast(
     n_snap: int,
     scratch: Scratch,
 ) -> int:
-    """Binary-search the maximum viable prefix length of ``added``.
-
-    ``sel_start_t`` and ``added_t`` are device int64 tensors. They're built once
-    per block by the caller and sliced on every iter, replacing the previous
-    per-iter ``torch.tensor(...)`` allocations.
-    """
     ensure_compiled()
     ext = get_ext()
 
@@ -47,40 +41,50 @@ def bisect_voronoi_fast(
         points_left = total_budget - mid
         final_size = n_sel_start + mid + points_left
 
-        # asking for more rows than exist -> trivially viable.
+        # asking for more rows than exist is trivially viable
         if final_size >= N:
             best, low = mid, mid + 1
             continue
 
-        # rebuild (h_mid, voronoi_mid) at this prefix length without re-running FPS.
+        # rebuild the state at this prefix length without rerunning fps
         h_mid, voronoi_mid = reconstruct_hausdorff_with_voronoi(
-            X, norms, h_snap, h_final, v_final, v_snap,
-            sel_start_t, added_t, mid, n_snap,
+            X,
+            norms,
+            h_snap,
+            h_final,
+            v_final,
+            v_snap,
+            sel_start_t,
+            added_t,
+            mid,
+            n_snap,
         )
 
-        # kthvalue early-exit - viable iff sep_mid beats the (n_pos - points_left)-th
-        # smallest positive Hausdorff (an upper bound on cov after a viable fill).
+        # kthvalue early exit, viable if sep_mid beats an upper bound on cov after a viable fill
         n_positive = int((h_mid >= 0).sum().item())
+
         if 0 < points_left < n_positive:
             rank = n_positive - points_left
             cov_upper = float(torch.kthvalue(h_mid[h_mid >= 0], rank).values.item())
+
             if sep_mid > cov_upper:
                 best, low = mid, mid + 1
                 continue
         elif points_left >= n_positive:
-            # we'll pick everything that's left -> cov collapses to 0, trivially viable.
+            # everything left gets picked so cov collapses to zero
             best, low = mid, mid + 1
             continue
 
-        # no fill needed - viability collapses to a max comparison.
+        # no fill needed, viability is a max comparison
         if points_left == 0:
             if sep_mid > float(h_mid.max().item()):
                 best, low = mid, mid + 1
             else:
                 high = mid - 1
+
             continue
 
-        # build initial-prefix tensors for the C++ sim (rows the sim shouldn't re-pick).
+        # initial prefix tensors for the sim, rows it must not pick again
         if n_sel_start + mid > 0:
             if mid == 0:
                 sel_t = sel_start_t
@@ -88,18 +92,33 @@ def bisect_voronoi_fast(
                 sel_t = added_t[:mid]
             else:
                 sel_t = torch.cat((sel_start_t, added_t[:mid]))
+
             X_sel_init, norms_sel_init = X[sel_t], norms[sel_t]
         else:
             X_sel_init = torch.empty((0, X.shape[1]), dtype=X.dtype, device=X.device)
             norms_sel_init = torch.empty(0, dtype=norms.dtype, device=X.device)
 
-        # slow path: actually run the FPS-fill loop in C++ and read back the viability flag.
+        # slow path, run the fps fill loop on device and read back the viability flag
         is_viable, _steps = ext.simulate_fps_voronoi(
-            X, norms, h_mid, voronoi_mid, X_sel_init, norms_sel_init,
-            float(sep_mid), int(points_left), scratch.full_fraction,
-            scratch.block_vals, scratch.block_idxs, scratch.d_out_val, scratch.d_out_idx,
-            scratch.sim_X_sel, scratch.sim_norms_sel, scratch.sim_dSL_quarter,
-            scratch.d_local_sep, scratch.d_viable, scratch.sim_active_mask,
+            X,
+            norms,
+            h_mid,
+            voronoi_mid,
+            X_sel_init,
+            norms_sel_init,
+            float(sep_mid),
+            int(points_left),
+            scratch.full_fraction,
+            scratch.block_vals,
+            scratch.block_idxs,
+            scratch.d_out_val,
+            scratch.d_out_idx,
+            scratch.sim_X_sel,
+            scratch.sim_norms_sel,
+            scratch.sim_dSL_quarter,
+            scratch.d_local_sep,
+            scratch.d_viable,
+            scratch.sim_active_mask,
         )
 
         if is_viable:

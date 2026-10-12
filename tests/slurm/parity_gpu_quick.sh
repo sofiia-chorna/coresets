@@ -6,20 +6,14 @@
 #SBATCH --time=00:15:00
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --account=lp133
+#SBATCH --account=ab010
 #SBATCH --partition=debug
 #SBATCH --output=logs/parity_gpu_quick_%j.out
 #SBATCH --uenv=pytorch/v2.9.1:v2
 #SBATCH --view=default
-#
-# Quick GPU parity gate vs accrete_experiments/. Synthetic input only.
-# Two python invocations (one per package) to avoid CUDA-extension cache
-# collision; outputs are byte-diffed.
-#
-# Pass: selected_ids byte-identical AND |Δt| / t_old < 10%.
-#
-# Usage: sbatch parity_gpu_quick.sh
-#        N_ANCHOR=8192 N_CAND=8192 DIM=128 MAX_K=13 sbatch parity_gpu_quick.sh
+
+# the uenv libcrypto breaks srun so unset LD_LIBRARY_PATH for the launcher and restore it in each task
+export UENV_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 
 set -e
 set -x
@@ -50,10 +44,11 @@ mkdir -p "$WORK" "$EXT_OLD" "$EXT_NEW"
 echo "STARTING $(date)"
 echo "  N_anchor=$N_ANCHOR  N_cand=$N_CAND  D=$DIM  max_k=$MAX_K"
 
-# --- Phase 1: original accrete_experiments ---------------------------------
+# phase 1 original package
 echo "=== Phase 1: accrete_experiments ==="
-srun -ul bash -c "
-    source \$SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c "
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:\$PATH
     export TORCH_EXTENSIONS_DIR=$EXT_OLD
     export PYTHONPATH=$REPO_OLD/src/cuda:\${PYTHONPATH:-}
     cd $REPO_OLD
@@ -63,10 +58,11 @@ srun -ul bash -c "
       --n-anchor $N_ANCHOR --n-cand $N_CAND --dim $DIM --max-k $MAX_K --seed $SEED
 "
 
-# --- Phase 2: refactored coresets ------------------------------------------
+# phase 2 refactored package
 echo "=== Phase 2: coresets (refactored) ==="
-srun -ul bash -c "
-    source \$SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c "
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:\$PATH
     export TORCH_EXTENSIONS_DIR=$EXT_NEW
     export PYTHONPATH=$REPO_NEW/src:\${PYTHONPATH:-}
     cd $REPO_NEW
@@ -76,7 +72,7 @@ srun -ul bash -c "
       --n-anchor $N_ANCHOR --n-cand $N_CAND --dim $DIM --max-k $MAX_K --seed $SEED
 "
 
-# --- Phase 3: byte-diff + timing -------------------------------------------
+# phase 3 byte diff and timing
 echo "=== Phase 3: parity check ==="
 python3 - <<PYEOF
 import sys, numpy as np
@@ -88,14 +84,15 @@ print(f"  new: {n.shape[0]:,} ids  t={float(new['time_s']):.3f}s  peak={float(ne
 
 fail = 0
 if o.shape != n.shape:
-    print(f"  FAIL  shape mismatch: {o.shape} vs {n.shape}"); fail += 1
+    print(f"  FAIL  shape mismatch: {o.shape} vs {n.shape}")
+    fail += 1
 elif np.array_equal(o, n):
     print(f"  OK    selected_ids byte-identical ({len(o):,} ids)")
 else:
     diff = np.where(o != n)[0]
     print(f"  FAIL  selected_ids differ at {len(diff):,}/{len(o):,}; first at {diff[0]}")
     print(f"        old[{diff[0]}]={o[diff[0]]}  new[{diff[0]}]={n[diff[0]]}")
-    # show next few diffs to help triage
+    # next few diffs for triage
     for j in diff[:5]:
         print(f"        pos {j}: old={o[j]} new={n[j]}")
     fail += 1
@@ -109,7 +106,8 @@ else:
     print(f"  OK    wall-time within ±10%")
 
 if fail:
-    print(f"FAIL: {fail} check(s) did not pass."); sys.exit(1)
+    print(f"FAIL: {fail} check(s) did not pass.")
+    sys.exit(1)
 print("ALL CHECKS PASSED.")
 PYEOF
 PARITY_EXIT=$?

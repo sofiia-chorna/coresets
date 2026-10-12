@@ -6,19 +6,14 @@
 #SBATCH --time=00:15:00
 #SBATCH --gres=gpu:4
 #SBATCH --mem=64G
-#SBATCH --account=lp133
+#SBATCH --account=ab010
 #SBATCH --partition=debug
 #SBATCH --output=logs/test_determinism_%j.out
 #SBATCH --uenv=pytorch/v2.9.1:v2
 #SBATCH --view=default
-#
-# Determinism smoke test: verify CUDA-1-GPU ≡ CUDA-4-GPU byte-for-byte on a
-# small synthetic dataset (N=8192, D=32, K=2048). Completes in ~1 minute.
-#
-# Exits 0 on byte-match, non-zero on mismatch (job state: FAILED).
-#
-# Usage:
-#   sbatch test_determinism.sh
+
+# the uenv libcrypto breaks srun so unset LD_LIBRARY_PATH for the launcher and restore it in each task
+export UENV_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 
 set -e
 set -x
@@ -32,48 +27,53 @@ export TORCH_CUDA_ARCH_LIST="9.0"
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_EXTENSIONS_DIR=/dev/shm/torch_ext_${SLURM_JOB_ID}
 
-REPO=$SCRATCH/merge-datasets/coresets
+# submit from inside the repo
+REPO=${REPO:-$(cd "${SLURM_SUBMIT_DIR:-.}" && git rev-parse --show-toplevel 2>/dev/null || pwd)}
 REF_FILE=$REPO/logs/ref_indices_${SLURM_JOB_ID}.npy
 REF_FILE_2=$REPO/logs/ref_indices_${SLURM_JOB_ID}_b.npy
 TRACE_SINGLE=$REPO/logs/trace_single_${SLURM_JOB_ID}.tsv
 TRACE_MULTI=$REPO/logs/trace_multi_${SLURM_JOB_ID}.tsv
 TRACE_SHARD=$REPO/logs/trace_shard_${SLURM_JOB_ID}.tsv
 
-# Config B: larger D, uneven shards (N not divisible by world_size), bigger K.
-# Exercises kernel edge cases Config A (N=8192, D=32, K=2048) doesn't hit.
+# config b has larger d, uneven shards and bigger k
 REF_FILE_B=$REPO/logs/ref_indices_${SLURM_JOB_ID}_cfgB.npy
 TRACE_SINGLE_B=$REPO/logs/trace_single_${SLURM_JOB_ID}_cfgB.tsv
 TRACE_SHARD_B=$REPO/logs/trace_shard_${SLURM_JOB_ID}_cfgB.tsv
-CFG_B_N=16383     # 16383 % 4 = 3 => last rank gets 4098, others 4095
+
+# 16383 is not divisible by 4 so the last rank gets 4098 and the others 4095
+CFG_B_N=16383
 CFG_B_D=128
 CFG_B_K=8192
 
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=${MASTER_PORT:-29501}   # different from benchmark port
+
+# different from the benchmark port
+export MASTER_PORT=${MASTER_PORT:-29501}
 
 echo "STARTING $(date)"
 
-# Phase 1a — single-GPU run #1 (produces reference for later phases)
+# phase 1a single gpu reference
 echo "=== Phase 1a: single-GPU run #1 ==="
-srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
-    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:$PATH
     export PYTHONPATH='"$REPO"'/src:${PYTHONPATH:-}
     cd '"$REPO"'
     python3 tests/test_determinism.py --mode single --out '"$REF_FILE"' --trace '"$TRACE_SINGLE"'
 '
 
-# Phase 1b — single-GPU run #2: verifies kernel determinism across re-runs
-# (catches atomic/scheduling non-determinism the single-vs-multi test misses).
+# phase 1b second single gpu run for rerun stability
 echo "=== Phase 1b: single-GPU run #2 (re-run stability) ==="
-srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
-    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:$PATH
     export PYTHONPATH='"$REPO"'/src:${PYTHONPATH:-}
     cd '"$REPO"'
     python3 tests/test_determinism.py --mode single --out '"$REF_FILE_2"'
 '
 
-# Compare the two single-GPU runs — must be byte-identical.
-python3 - <<PYEOF || { echo "Re-run stability FAILED"; exit 1; }
+# the two single gpu runs must be byte identical
+if ! python3 - <<PYEOF
 import numpy as np, sys
 a = np.load("$REF_FILE")
 b = np.load("$REF_FILE_2")
@@ -83,13 +83,18 @@ if a.shape != b.shape or not (a == b).all():
     sys.exit(1)
 print(f"OK re-run: byte-identical across two single-GPU runs ({len(a):,} indices).")
 PYEOF
+then
+    echo "Re-run stability FAILED"
+    exit 1
+fi
 
-# Phase 2 — multi-GPU replicated-X run, asserts byte-identical.
-# set +e so that a mismatch (exit 1) doesn't prevent subsequent phases.
+# phase 2 replicated x on four gpus
+# errexit is turned off here so a mismatch does not stop the later phases
 set +e
 echo "=== Phase 2: multi-GPU replicated-X (world_size=4) vs single-GPU reference ==="
-srun -ul bash -c '
-    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c '
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:$PATH
     export PYTHONPATH='"$REPO"'/src:${PYTHONPATH:-}
     cd '"$REPO"'
     export RANK=$SLURM_PROCID
@@ -108,10 +113,11 @@ else
     echo "Trace files missing; skipping diff."
 fi
 
-# Phase 3 — multi-GPU sharded-X run, asserts byte-identical.
+# phase 3 sharded x on four gpus
 echo "=== Phase 3: multi-GPU sharded-X (world_size=4) vs single-GPU reference ==="
-srun -ul bash -c '
-    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c '
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:$PATH
     export PYTHONPATH='"$REPO"'/src:${PYTHONPATH:-}
     cd '"$REPO"'
     export RANK=$SLURM_PROCID
@@ -131,13 +137,12 @@ else
     echo "Trace files missing; skipping diff."
 fi
 
-# Phase 4 — Config B: single-GPU reference at N=16383, D=128, K=8192.
-#   N=16383 on world_size=4 => shard sizes [4095, 4095, 4095, 4098] (uneven).
-#   Catches bugs specific to remainder-shard + D!=32 that Config A can't reach.
+# phase 4 config b with uneven shards
 set +e
 echo "=== Phase 4a: Config B single-GPU reference (N=$CFG_B_N, D=$CFG_B_D, K=$CFG_B_K) ==="
-srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
-    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:$PATH
     export PYTHONPATH='"$REPO"'/src:${PYTHONPATH:-}
     cd '"$REPO"'
     python3 tests/test_determinism.py --mode single \
@@ -147,8 +152,9 @@ srun --ntasks=1 --ntasks-per-node=1 --gres=gpu:1 -ul bash -c '
 CFG_B_SINGLE_EXIT=$?
 
 echo "=== Phase 4b: Config B sharded-X (world_size=4) vs Config B reference ==="
-srun -ul bash -c '
-    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c '
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:$PATH
     export PYTHONPATH='"$REPO"'/src:${PYTHONPATH:-}
     cd '"$REPO"'
     export RANK=$SLURM_PROCID
@@ -170,7 +176,7 @@ else
     echo "Config B trace files missing; skipping diff."
 fi
 
-# Cleanup
+# cleanup
 rm -f "$REF_FILE" "$REF_FILE_2" "$REF_FILE_B"
 
 echo "ENDING $(date)"

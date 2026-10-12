@@ -6,19 +6,14 @@
 #SBATCH --time=00:10:00
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
-#SBATCH --account=lp133
+#SBATCH --account=ab010
 #SBATCH --partition=debug
 #SBATCH --output=test_invariants_%j.out
 #SBATCH --uenv=pytorch/v2.9.1:v2
 #SBATCH --view=default
-#
-# Coverage/separation invariant test: verify Gonzalez FPS guarantees hold
-# at every hierarchical layer on a small synthetic dataset.  Runs in ~1 min.
-#
-# Exits 0 on all-invariants-hold, non-zero on violation.
-#
-# Usage:
-#   sbatch test_invariants.sh
+
+# the uenv libcrypto breaks srun so unset LD_LIBRARY_PATH for the launcher and restore it in each task
+export UENV_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 
 set -e
 set -x
@@ -30,12 +25,14 @@ export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export TORCH_CUDA_ARCH_LIST="9.0"
 export TORCH_EXTENSIONS_DIR=/dev/shm/torch_ext_${SLURM_JOB_ID}
 
-REPO=$SCRATCH/merge-datasets/coresets
+# submit from inside the repo
+REPO=${REPO:-$(cd "${SLURM_SUBMIT_DIR:-.}" && git rev-parse --show-toplevel 2>/dev/null || pwd)}
 
 echo "STARTING $(date)"
 
-srun -ul bash -c '
-    source $SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c '
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:$PATH
     export PYTHONPATH='"$REPO"'/src:${PYTHONPATH:-}
     cd '"$REPO"'
     python3 tests/test_invariants.py

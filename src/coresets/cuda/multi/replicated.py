@@ -1,10 +1,3 @@
-"""Multi-GPU FPS-accretion with X **replicated** on every rank.
-
-Memory-capped at ~27 M points per H100. For larger N use the sharded path —
-this driver is kept primarily for the determinism test (single ≡ replicated
-≡ sharded byte-identity).
-"""
-
 from __future__ import annotations
 
 from typing import Any, Optional, Tuple
@@ -19,9 +12,8 @@ from ._shared import resolve_max_k
 from .layout import ShardLayout, compute_shard_layout
 
 
+# the matrix is on every rank so new center rows are read locally instead of gathered
 class ReplicatedDriver(MultiGPUAccrete):
-    """X is on every rank; new-center rows are read locally instead of gathered."""
-
     DRIVER_NAME = "accrete_voronoi_multi"
 
     def __init__(
@@ -39,22 +31,6 @@ class ReplicatedDriver(MultiGPUAccrete):
         profile: bool,
         trace_path: Optional[str],
     ):
-        """Build the replicated-X driver.
-
-        Args:
-            X_full: ``(n_global, D)`` — global feature matrix, identical on every rank.
-            norms_full: ``(n_global,)`` float32 — row norms of ``X_full``.
-            idx_A: ``(n_anchor,)`` int64 — anchor FPS hierarchy.
-            n_anchor: number of anchor rows in the global matrix.
-            n_global: total number of rows.
-            layout: shard geometry derived from
-                :func:`~coresets.cuda.multi.layout.compute_shard_layout`.
-            max_k, max_sel: final coreset size ``= 2 ** max_k = max_sel``.
-            max_argmax_blocks: launch-grid size for the two-phase argmax kernel
-                (typically ``ext.MAX_ARGMAX_BLOCKS``).
-            verbose, profile: progress + timing on rank 0.
-            trace_path: diagnostic TSV log path (rank 0 only); ``None`` disables.
-        """
         super().__init__(
             layout=layout,
             device=X_full.device,
@@ -72,16 +48,15 @@ class ReplicatedDriver(MultiGPUAccrete):
             profile=profile,
             trace_path=trace_path,
         )
+
         self.X_full = X_full
         self.norms_full = norms_full
         self.X_shard = X_full[layout.shard_offset : layout.shard_offset + layout.N_shard]
         self.norms_shard = norms_full[layout.shard_offset : layout.shard_offset + layout.N_shard]
 
-        # views read by the base bisect.
+        # views read by the base bisect
         self.x_shard_view = self.X_shard
         self.norms_shard_view = self.norms_shard
-
-    # ----------------------------------------------------------------- phases
 
     def _seed(self, first: int) -> None:
         self._voronoi_step(first, 0, self.layout.owner_of(first))
@@ -94,11 +69,15 @@ class ReplicatedDriver(MultiGPUAccrete):
         if layout.N_shard > 0:
             ext.argmax_cuda(
                 self.hausdorff_shard,
-                scratch.block_vals, scratch.block_idxs, scratch.d_out_val, scratch.d_out_idx,
+                scratch.block_vals,
+                scratch.block_idxs,
+                scratch.d_out_val,
+                scratch.d_out_idx,
                 layout.N_shard,
             )
             ext.pack_argmax_pair_cuda(
-                scratch.d_out_val, scratch.d_out_idx,
+                scratch.d_out_val,
+                scratch.d_out_idx,
                 int(layout.shard_offset),
                 scratch.argmax_local_pack,
             )
@@ -107,11 +86,12 @@ class ReplicatedDriver(MultiGPUAccrete):
 
         dist.all_gather_into_tensor(scratch.argmax_gather_buf, scratch.argmax_local_pack)
 
-        # gather_buf is (G, 2) when reshaped: [val, int32-bitcast idx] per rank.
+        # the gather buffer holds a value and an int32 bitcast index per rank
         gathered = scratch.argmax_gather_buf.view(layout.world_size, 2)
         winner = int(torch.argmax(gathered[:, 0]).item())
         best_val = float(gathered[winner, 0].item())
         best_idx = int(gathered.view(torch.int32)[winner, 1].item())
+
         return best_val, best_idx, None
 
     def _restricted_argmax(self, pool_global: Tensor) -> Tuple[float, int, Any]:
@@ -141,10 +121,11 @@ class ReplicatedDriver(MultiGPUAccrete):
         winner = int(torch.argmax(gathered[:, 0]).item())
         best_val = float(gathered[winner, 0].item())
         best_idx = int(gathered.view(torch.int32)[winner, 1].item())
+
         return best_val, best_idx, None
 
+    # ctx is unused, the argmax already gives the global index and X is local
     def _commit_argmax_winner(self, new_idx: int, sel_pos: int, ctx: Any) -> None:
-        # ctx unused — argmax already gives the global idx and X is local
         with self.profiler("voronoi_step_s"):
             self._voronoi_step(new_idx, sel_pos, self.layout.owner_of(new_idx))
 
@@ -152,16 +133,16 @@ class ReplicatedDriver(MultiGPUAccrete):
         with self.profiler("voronoi_step_s"):
             self._voronoi_step(new_idx, sel_pos, self.layout.owner_of(new_idx))
 
+    # commit a center and update hausdorff and voronoi on every shard
     def _voronoi_step(self, new_global_idx: int, sel_pos: int, owner_rank: int) -> None:
-        """Commit a center; update Hausdorff/Voronoi on every shard"""
         ext = get_ext()
         scratch = self.scratch
 
-        # X is replicated, so read the new center's row locally
+        # the matrix is replicated so the new center row is read locally
         self.X_sel[sel_pos].copy_(self.X_full[new_global_idx])
         self.norms_sel[sel_pos] = self.norms_full[new_global_idx]
 
-        # owner rank also marks its h=-1 / v=sel_pos cell
+        # the owner rank also marks its own cell
         if self.layout.rank == owner_rank:
             local_idx = self.layout.to_local(new_global_idx)
             self.hausdorff_shard[local_idx] = -1.0
@@ -172,15 +153,30 @@ class ReplicatedDriver(MultiGPUAccrete):
 
         if sel_pos == 0:
             ext.fps_update_cuda(
-                self.X_shard, self.norms_shard, x_new,
-                self.hausdorff_shard, self.voronoi_shard, norm_new, sel_pos,
+                self.X_shard,
+                self.norms_shard,
+                x_new,
+                self.hausdorff_shard,
+                self.voronoi_shard,
+                norm_new,
+                sel_pos,
             )
         else:
-            ext.compute_dSL_quarter_cuda(self.X_sel, self.norms_sel, scratch.dSL_quarter, sel_pos)
+            ext.compute_dSL_quarter_cuda(
+                self.X_sel,
+                self.norms_sel,
+                scratch.dSL_quarter,
+                sel_pos,
+            )
             ext.voronoi_update_cuda(
-                self.X_shard, self.norms_shard, x_new,
+                self.X_shard,
+                self.norms_shard,
+                x_new,
                 scratch.dSL_quarter[:sel_pos],
-                self.hausdorff_shard, self.voronoi_shard, norm_new, sel_pos,
+                self.hausdorff_shard,
+                self.voronoi_shard,
+                norm_new,
+                sel_pos,
             )
 
     def _simulate(
@@ -198,18 +194,34 @@ class ReplicatedDriver(MultiGPUAccrete):
         layout = self.layout
 
         is_viable, steps_used = ext.simulate_fps_voronoi_multi(
-            self.X_shard, self.norms_shard,
-            h_mid, voronoi_mid,
-            self.X_full, self.norms_full,
-            sim_X_sel, sim_norms_sel,
-            sim_X_sel[:n_init], sim_norms_sel[:n_init],
-            scratch.block_vals, scratch.block_idxs, scratch.d_out_val, scratch.d_out_idx,
-            scratch.argmax_local_pack, scratch.argmax_gather_buf,
-            scratch.sim_dSL_quarter, scratch.d_local_sep, scratch.d_viable, scratch.sim_active_mask,
-            float(sep_mid), int(points_left),
-            int(layout.shard_offset), int(layout.N_shard), int(layout.world_size),
+            self.X_shard,
+            self.norms_shard,
+            h_mid,
+            voronoi_mid,
+            self.X_full,
+            self.norms_full,
+            sim_X_sel,
+            sim_norms_sel,
+            sim_X_sel[:n_init],
+            sim_norms_sel[:n_init],
+            scratch.block_vals,
+            scratch.block_idxs,
+            scratch.d_out_val,
+            scratch.d_out_idx,
+            scratch.argmax_local_pack,
+            scratch.argmax_gather_buf,
+            scratch.sim_dSL_quarter,
+            scratch.d_local_sep,
+            scratch.d_viable,
+            scratch.sim_active_mask,
+            float(sep_mid),
+            int(points_left),
+            int(layout.shard_offset),
+            int(layout.N_shard),
+            int(layout.world_size),
             scratch.pg,
         )
+
         return bool(is_viable), int(steps_used)
 
     def _global_max_h(self, h_shard: Tensor) -> float:
@@ -219,7 +231,10 @@ class ReplicatedDriver(MultiGPUAccrete):
         if self.layout.N_shard > 0:
             ext.argmax_cuda(
                 h_shard,
-                scratch.block_vals, scratch.block_idxs, scratch.d_out_val, scratch.d_out_idx,
+                scratch.block_vals,
+                scratch.block_idxs,
+                scratch.d_out_val,
+                scratch.d_out_idx,
                 self.layout.N_shard,
             )
             scratch.argmax_local_pack[0] = scratch.d_out_val[0]
@@ -229,12 +244,11 @@ class ReplicatedDriver(MultiGPUAccrete):
             scratch.argmax_local_pack[1] = 0.0
 
         dist.all_gather_into_tensor(scratch.argmax_gather_buf, scratch.argmax_local_pack)
+
         return float(scratch.argmax_gather_buf[0::2].max().item())
 
 
-# ----------------------------------------------------------------- public API
-
-
+# multi gpu accrete with X replicated on every rank, returns the same global indices on every rank
 def accrete_voronoi_multi(
     X_A: Tensor,
     X_C: Tensor,
@@ -246,16 +260,6 @@ def accrete_voronoi_multi(
     profile: bool = False,
     trace_path: Optional[str] = None,
 ) -> Tensor:
-    """Multi-GPU CUDA accrete with X replicated on every rank.
-
-    Args:
-        X_A, X_C: full global anchor + candidate matrices (identical on each rank).
-        idx_A: anchor FPS-hierarchy indices (into the global matrix).
-        rank, world_size: distributed group geometry.
-        max_k: final coreset size = ``2 ** max_k``; auto-derived from GPU mem if ``None``.
-
-    Returns global coreset indices (same tensor on every rank).
-    """
     if not dist.is_initialized():
         raise RuntimeError(
             "torch.distributed is not initialised. "
@@ -267,11 +271,15 @@ def accrete_voronoi_multi(
 
     n_anchor = X_A.shape[0]
     n_cand = X_C.shape[0]
+
     if n_anchor == 0:
         raise ValueError("X_A is empty — need at least one anchor point.")
+
     dim = X_A.shape[1]
+
     if n_cand > 0 and X_C.shape[1] != dim:
         raise ValueError(f"feature-dim mismatch: X_A={dim}, X_C={X_C.shape[1]}")
+
     n_global = n_anchor + n_cand
 
     sizes, offsets = compute_shard_layout(n_global, world_size)
@@ -296,4 +304,5 @@ def accrete_voronoi_multi(
         profile=profile,
         trace_path=trace_path,
     )
+
     return driver.run()

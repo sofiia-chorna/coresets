@@ -6,20 +6,14 @@
 #SBATCH --time=00:15:00
 #SBATCH --gres=gpu:4
 #SBATCH --mem=64G
-#SBATCH --account=lp133
+#SBATCH --account=ab010
 #SBATCH --partition=debug
 #SBATCH --output=logs/parity_gpu_sharded_%j.out
 #SBATCH --uenv=pytorch/v2.9.1:v2
 #SBATCH --view=default
-#
-# Multi-GPU sharded parity gate vs accrete_experiments/. Synthetic input.
-# Two srun invocations (one per package) — separate CUDA extension caches.
-#
-# Pass: rank-0 selected_ids byte-identical AND |Δt|/t_old < 15%
-#       (multi-GPU runs jitter more than single-GPU; relax to 15%).
-#
-# Usage: sbatch parity_gpu_sharded.sh
-#        N_ANCHOR=8192 MAX_K=13 sbatch parity_gpu_sharded.sh
+
+# the uenv libcrypto breaks srun so unset LD_LIBRARY_PATH for the launcher and restore it in each task
+export UENV_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 
 set -e
 set -x
@@ -54,10 +48,11 @@ export MASTER_PORT=${MASTER_PORT:-29512}
 echo "STARTING $(date)"
 echo "  world_size=$SLURM_NTASKS  N_anchor=$N_ANCHOR  N_cand=$N_CAND  D=$DIM  max_k=$MAX_K"
 
-# --- Phase 1: original ----------------------------------------------------
+# phase 1 original package
 echo "=== Phase 1: accrete_experiments (sharded, world=$SLURM_NTASKS) ==="
-srun -ul bash -c "
-    source \$SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c "
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:\$PATH
     export TORCH_EXTENSIONS_DIR=$EXT_OLD
     export PYTHONPATH=$REPO_OLD/src/cuda:\${PYTHONPATH:-}
     export RANK=\$SLURM_PROCID
@@ -69,10 +64,11 @@ srun -ul bash -c "
       --n-anchor $N_ANCHOR --n-cand $N_CAND --dim $DIM --max-k $MAX_K --seed $SEED
 "
 
-# --- Phase 2: refactored --------------------------------------------------
+# phase 2 refactored package
 echo "=== Phase 2: coresets refactored (sharded, world=$SLURM_NTASKS) ==="
-srun -ul bash -c "
-    source \$SCRATCH/merge-datasets/torch-test/venv-pt291/bin/activate
+env -u LD_LIBRARY_PATH srun -ul bash -c "
+    export LD_LIBRARY_PATH=$UENV_LD_LIBRARY_PATH
+    export PATH=/user-environment/env/default/bin:\$PATH
     export TORCH_EXTENSIONS_DIR=$EXT_NEW
     export PYTHONPATH=$REPO_NEW/src:\${PYTHONPATH:-}
     export RANK=\$SLURM_PROCID
@@ -84,18 +80,20 @@ srun -ul bash -c "
       --n-anchor $N_ANCHOR --n-cand $N_CAND --dim $DIM --max-k $MAX_K --seed $SEED
 "
 
-# --- Phase 3: byte-diff ---------------------------------------------------
+# phase 3 byte diff
 echo "=== Phase 3: parity check ==="
 python3 - <<PYEOF
 import sys, numpy as np
-old = np.load("$OUT_OLD"); new = np.load("$OUT_NEW")
+old = np.load("$OUT_OLD")
+new = np.load("$OUT_NEW")
 o, n = old["selected_ids"], new["selected_ids"]
 print(f"  old: {o.shape[0]:,} ids  t={float(old['time_s']):.3f}s  peak={float(old['peak_mem_gb']):.3f} GB")
 print(f"  new: {n.shape[0]:,} ids  t={float(new['time_s']):.3f}s  peak={float(new['peak_mem_gb']):.3f} GB")
 
 fail = 0
 if o.shape != n.shape:
-    print(f"  FAIL  shape mismatch: {o.shape} vs {n.shape}"); fail += 1
+    print(f"  FAIL  shape mismatch: {o.shape} vs {n.shape}")
+    fail += 1
 elif np.array_equal(o, n):
     print(f"  OK    selected_ids byte-identical ({len(o):,} ids)")
 else:
@@ -115,7 +113,8 @@ else:
     print(f"  OK    wall-time within ±15%")
 
 if fail:
-    print(f"FAIL: {fail} check(s)."); sys.exit(1)
+    print(f"FAIL: {fail} check(s).")
+    sys.exit(1)
 print("ALL CHECKS PASSED.")
 PYEOF
 PARITY_EXIT=$?

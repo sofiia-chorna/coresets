@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Sofiia Chorna"},
+    {name = "Sofiia Chorna", email = "sofiia.chorna1@gmail.com"},
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -29,6 +29,13 @@ dependencies = [
 dev = [
     "pytest>=7",
 ]
+
+[project.urls]
+Repository = "https://github.com/sofiia-chorna/coresets"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
