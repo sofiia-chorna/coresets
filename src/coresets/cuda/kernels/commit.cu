@@ -1,8 +1,8 @@
-// kernels/commit.cu — center-commit + Voronoi-skip-bound kernels.
 #include "_shared.cuh"
 
-// Basic commit: X[best]=>X_sel[n_sel], record norm, mark h_m[best]=-1 and
-// voronoi_m[best]=n_sel. Caller passes best_idx via a 1-elt device tensor.
+// commit the winning row as center n_sel
+// copies the row into X_sel, saves its norm and marks it as selected
+// the row index comes from a one element device tensor, so the host never has to read it
 template <typename scalar_t>
 __global__ void commit_center_kernel(const scalar_t* __restrict__ X,
                                      const float* __restrict__ norms, scalar_t* X_sel,
@@ -10,20 +10,24 @@ __global__ void commit_center_kernel(const scalar_t* __restrict__ X,
                                      const int* __restrict__ d_best_idx, const int64_t n_sel,
                                      const int D) {
     int best_idx = d_best_idx[0];
+
+    // thread 0 does the scalar writes, a distance of minus one means selected
     if (threadIdx.x == 0) {
         norms_sel[n_sel] = norms[best_idx];
         h_m[best_idx] = -1.0f;
         voronoi_m[best_idx] = n_sel;
     }
+
+    // all threads share the row copy
     const scalar_t* src = X + (int64_t) best_idx * D;
     scalar_t* dst = X_sel + (int64_t) n_sel * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x)
         dst[i] = src[i];
 }
 
-// Commit + on-device sep update + viability flag (kills per-step D2H inside
-// simulate_fps_voronoi). Viability: if the prior local_sep already exceeded
-// max(h), no future step can violate sep > cov => set d_viable=1.
+// commit as above, and also update the running separation and the viability flag on device
+// this keeps simulate_fps_voronoi free of host reads inside its loop
+// d_best_val is max h before this pick, which is the current coverage
 template <typename scalar_t>
 __global__ void commit_center_with_sep_kernel(const scalar_t* __restrict__ X,
                                               const float* __restrict__ norms, scalar_t* X_sel,
@@ -37,28 +41,37 @@ __global__ void commit_center_with_sep_kernel(const scalar_t* __restrict__ X,
     if (threadIdx.x == 0) {
         float bv = *d_best_val;
         float sep = *d_local_sep;
+
+        // the separation so far already beats the coverage, so this probe is viable
         if (sep > bv)
-            *d_viable = 1;  // prior sep already beats current max(h) => viable
+            *d_viable = 1;
+
+        // keep the running minimum separation
         if (bv < sep)
-            *d_local_sep = bv;  // running-min update
+            *d_local_sep = bv;
+
+        // mark the row as selected
         norms_sel[n_sel] = norms[best_idx];
         h_m[best_idx] = -1.0f;
         voronoi_m[best_idx] = n_sel;
     }
 
+    // all threads share the row copy
     const scalar_t* src = X + (int64_t) best_idx * D;
     scalar_t* dst = X_sel + (int64_t) n_sel * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x)
         dst[i] = src[i];
 }
 
-// dSL_quarter[v] = 0.25 · ||X_sel[v] - x_new||²  for v in [0, n_sel).
-// x_new = X_sel[n_sel] (the just-committed center). One warp per row.
+// voronoi bound for every old center v below n_sel
+// dSL_quarter of v is a quarter of the squared distance from center v to the new center
+// the new center is the row just committed at slot n_sel, one warp per old center
 template <typename scalar_t>
 __global__ void compute_dSL_quarter_kernel(const scalar_t* __restrict__ X_sel,
                                            const float* __restrict__ norms_sel,
                                            float* __restrict__ dSL_quarter, const int n_sel,
                                            const int D) {
+    // copy the new center into shared memory once per block
     extern __shared__ __align__(sizeof(double)) unsigned char smem_dsl[];
     scalar_t* shared_x_new = reinterpret_cast<scalar_t*>(smem_dsl);
 
@@ -67,6 +80,7 @@ __global__ void compute_dSL_quarter_kernel(const scalar_t* __restrict__ X_sel,
         shared_x_new[i] = x_new[i];
     __syncthreads();
 
+    // each warp owns one old center
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = threadIdx.x % 32;
     int row = warp_id;
@@ -75,36 +89,40 @@ __global__ void compute_dSL_quarter_kernel(const scalar_t* __restrict__ X_sel,
 
     float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
 
+    // add up the 32 partial sums into lane 0
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
         dot += __shfl_down_sync(0xffffffff, dot, offset);
 
+    // a quarter of the squared distance, from the norms and the dot
     if (lane == 0) {
         float norm_new = __ldg(&norms_sel[n_sel]);
         dSL_quarter[row] = (__ldg(&norms_sel[row]) + norm_new - 2.0f * dot) * 0.25f;
     }
 }
 
-// active_mask[v] = 1 iff some unselected row points to center v.
-// Caller pre-zeroes the mask. Lets compute_dSL_quarter_masked skip dead
-// Voronoi cells whose dSL bound nobody reads.
+// flag every center that still has at least one unselected row in its cell
+// the caller zeroes the mask first
+// a center left at zero has an empty cell, so nobody will ever read its bound
 __global__ void mark_active_centers_kernel(const float* __restrict__ h_m,
                                            const int64_t* __restrict__ voronoi_m,
                                            int* __restrict__ active_mask, const int N) {
+    // many rows share a center, so the flag is set atomically
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += gridDim.x * blockDim.x) {
         if (h_m[i] >= 0.0f)
             atomicOr(&active_mask[voronoi_m[i]], 1);
     }
 }
 
-// Same as compute_dSL_quarter_kernel but skips centers with active_mask==0.
-// Skips 30–80% of rows at high n_sel — proportional bandwidth win.
+// same as compute_dSL_quarter_kernel, but skips the centers with an empty cell
+// at large n_sel many cells are empty, so this saves a lot of memory traffic
 template <typename scalar_t>
 __global__ void compute_dSL_quarter_masked_kernel(const scalar_t* __restrict__ X_sel,
                                                   const float* __restrict__ norms_sel,
                                                   float* __restrict__ dSL_quarter,
                                                   const int* __restrict__ active_mask,
                                                   const int n_sel, const int D) {
+    // copy the new center into shared memory once per block
     extern __shared__ __align__(sizeof(double)) unsigned char smem_dslm[];
     scalar_t* shared_x_new = reinterpret_cast<scalar_t*>(smem_dslm);
 
@@ -113,29 +131,34 @@ __global__ void compute_dSL_quarter_masked_kernel(const scalar_t* __restrict__ X
         shared_x_new[i] = x_new[i];
     __syncthreads();
 
+    // each warp owns one old center
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = threadIdx.x % 32;
     int row = warp_id;
     if (row >= n_sel)
         return;
 
+    // the flag is per center, so the whole warp leaves together
     if (!__ldg(&active_mask[row]))
-        return;  // uniform across the warp, no divergence
+        return;
 
     float dot = warp_dot(X_sel + (int64_t) row * D, shared_x_new, D, lane);
 
+    // add up the 32 partial sums into lane 0
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
         dot += __shfl_down_sync(0xffffffff, dot, offset);
 
+    // a quarter of the squared distance, from the norms and the dot
     if (lane == 0) {
         float norm_new = __ldg(&norms_sel[n_sel]);
         dSL_quarter[row] = (__ldg(&norms_sel[row]) + norm_new - 2.0f * dot) * 0.25f;
     }
 }
 
-// ------------ C++ launch wrappers ------------
+// host launchers
 
+// a commit is a single block whose threads share the row copy
 void commit_center_cuda(torch::Tensor X, torch::Tensor norms, torch::Tensor X_sel,
                         torch::Tensor norms_sel, torch::Tensor h_m, torch::Tensor voronoi_m,
                         torch::Tensor d_out_idx, int64_t n_sel) {
@@ -167,6 +190,7 @@ void commit_center_with_sep_cuda(torch::Tensor X, torch::Tensor norms, torch::Te
         }));
 }
 
+// one warp per old center, 8 per block, nothing to do before the second center
 void compute_dSL_quarter_cuda(torch::Tensor X_sel, torch::Tensor norms_sel,
                               torch::Tensor dSL_quarter, int64_t n_sel) {
     if (n_sel == 0)
@@ -185,6 +209,7 @@ void compute_dSL_quarter_cuda(torch::Tensor X_sel, torch::Tensor norms_sel,
         }));
 }
 
+// grid stride launch capped at 1024 blocks
 void mark_active_centers_cuda(torch::Tensor h_m, torch::Tensor voronoi_m, torch::Tensor active_mask,
                               int64_t N) {
     if (N == 0)
@@ -195,6 +220,7 @@ void mark_active_centers_cuda(torch::Tensor h_m, torch::Tensor voronoi_m, torch:
         h_m.data_ptr<float>(), voronoi_m.data_ptr<int64_t>(), active_mask.data_ptr<int>(), (int) N);
 }
 
+// same launch shape as compute_dSL_quarter_cuda
 void compute_dSL_quarter_masked_cuda(torch::Tensor X_sel, torch::Tensor norms_sel,
                                      torch::Tensor dSL_quarter, torch::Tensor active_mask,
                                      int64_t n_sel) {

@@ -1,18 +1,17 @@
-// kernels/argmax.cu — two-phase argmax with deterministic tie-break.
-// argmax_better helper lives in _shared.cuh (visible across translation units).
 #include "_shared.cuh"
 
-// Determinism: naive parallel argmax is non-deterministic on ties — launch
-// geometry decides the winner. FPS is chaotic, so a flipped tie cascades
-// into a different coreset 10 steps later. Tie-break = smaller global idx
-// (one extra int compare, no measurable cost). Gives single ≡ multi
-// byte-identity. Does NOT match torch.argmax bitwise — cuBLAS GEMV has a
-// different FP reduction order, so the distances themselves disagree in
-// the last bit, which a tie-break can't paper over.
+// why the tie break matters
+// a plain parallel argmax lets the launch shape decide the winner when two values are equal
+// fps is chaotic, one flipped tie gives a different coreset a few steps later
+// so every reduction here prefers the smaller index, which costs one extra int compare
+// this makes 1 gpu and N gpus byte identical
+// it does not match torch.argmax bit for bit, because cublas sums distances in another order
 
+// phase one, each block reduces a strided slice of h to one value and index pair
 template <typename scalar_t>
 __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __restrict__ block_vals,
                                      int* __restrict__ block_idxs, const int N) {
+    // shared memory holds one value and one index per thread
     extern __shared__ __align__(8) unsigned char smem_argmax[];
     float* sv = reinterpret_cast<float*>(smem_argmax);
     int* si = reinterpret_cast<int*>(smem_argmax + blockDim.x * sizeof(float));
@@ -21,10 +20,11 @@ __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __re
     int global_start = blockIdx.x * blockDim.x + tid;
     int stride = gridDim.x * blockDim.x;
 
-    // Sentinel idx = INT_MAX so any real index wins on ties.
+    // start from an index of INT_MAX so any real row wins a tie against it
     float local_val = -1e38f;
     int local_idx = INT_MAX;
 
+    // grid stride loop, each thread visits rows that are stride apart
     for (int i = global_start; i < N; i += stride) {
         float v = (float) h[i];
         if (argmax_better(v, i, local_val, local_idx)) {
@@ -37,7 +37,7 @@ __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __re
     si[tid] = local_idx;
     __syncthreads();
 
-    // Tree reduction with tie-break.
+    // tree reduction in shared memory, with the same tie break
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
             float v_other = sv[tid + s];
@@ -50,22 +50,23 @@ __global__ void argmax_phase1_kernel(const scalar_t* __restrict__ h, float* __re
         __syncthreads();
     }
 
+    // thread 0 writes the winner of this block
     if (tid == 0) {
         block_vals[blockIdx.x] = sv[0];
         block_idxs[blockIdx.x] = si[0];
     }
 }
 
-// Phase 2: warp shuffle reduction over the ≤1024 phase-1 partials.
-// Launch <<<1, 32>>> — each lane covers n_blocks/32 entries.
+// phase two, a single warp reduces the block winners, at most 1024 of them
 __global__ void argmax_phase2_kernel(const float* __restrict__ block_vals,
                                      const int* __restrict__ block_idxs,
                                      float* __restrict__ d_out_val, int* __restrict__ d_out_idx,
                                      const int n_blocks) {
-    int tid = threadIdx.x;  // 0..31
+    int tid = threadIdx.x;
     float best_val = -1e38f;
-    int best_idx = INT_MAX;  // sentinel — any real idx wins on ties
+    int best_idx = INT_MAX;
 
+    // each lane scans every 32nd block winner
     for (int i = tid; i < n_blocks; i += 32) {
         float v = block_vals[i];
         int j = block_idxs[i];
@@ -75,7 +76,7 @@ __global__ void argmax_phase2_kernel(const float* __restrict__ block_vals,
         }
     }
 
-// Lane i reads lane i+offset; after log2(32) rounds lane 0 holds the winner.
+    // warp shuffle reduction, after five rounds lane 0 holds the winner
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         float other_val = __shfl_down_sync(0xffffffff, best_val, offset);
@@ -86,13 +87,15 @@ __global__ void argmax_phase2_kernel(const float* __restrict__ block_vals,
         }
     }
 
+    // no real row found is reported as index minus one
     if (tid == 0) {
         d_out_val[0] = best_val;
-        d_out_idx[0] = (best_idx == INT_MAX) ? -1 : best_idx;  // sentinel => -1
+        d_out_idx[0] = (best_idx == INT_MAX) ? -1 : best_idx;
     }
 }
 
-// Max-value-only kernels (used by the viability early-exit; no index needed).
+// max value only, for checks that need no index
+// same two phase shape as the argmax above
 
 template <typename scalar_t>
 __global__ void max_phase1_kernel(const scalar_t* __restrict__ h, float* __restrict__ block_vals,
@@ -102,6 +105,7 @@ __global__ void max_phase1_kernel(const scalar_t* __restrict__ h, float* __restr
     int global_start = blockIdx.x * blockDim.x + tid;
     int stride = gridDim.x * blockDim.x;
 
+    // grid stride loop, each thread visits rows that are stride apart
     float local_val = -1e38f;
     for (int i = global_start; i < N; i += stride) {
         float v = (float) h[i];
@@ -111,6 +115,7 @@ __global__ void max_phase1_kernel(const scalar_t* __restrict__ h, float* __restr
     smem_max[tid] = local_val;
     __syncthreads();
 
+    // tree reduction in shared memory
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s && smem_max[tid + s] > smem_max[tid])
             smem_max[tid] = smem_max[tid + s];
@@ -120,7 +125,7 @@ __global__ void max_phase1_kernel(const scalar_t* __restrict__ h, float* __restr
         block_vals[blockIdx.x] = smem_max[0];
 }
 
-// Phase 2: warp reduction. Launch <<<1, 32>>>.
+// phase two, a single warp reduces the block maxima
 __global__ void max_phase2_kernel(const float* __restrict__ block_vals,
                                   float* __restrict__ d_out_val, const int n_blocks) {
     int tid = threadIdx.x;
@@ -140,27 +145,24 @@ __global__ void max_phase2_kernel(const float* __restrict__ block_vals,
         d_out_val[0] = best_val;
 }
 
-// C1: post-loop viability check. The in-loop test compares sep against the
-// max(h) *before* the final update — without this the bisect reports
-// non-viable where the reference reports viable. Stays on device (no D2H).
-
-__global__ void final_viable_check_kernel(
-    const float* __restrict__ d_out_val,    // [1] max(h_m) after final update
-    const float* __restrict__ d_local_sep,  // [1] running min separation
-    int* __restrict__ d_viable)             // [1]
-{
+// final viability check after a sim loop
+// the check inside the loop compares sep with max h from before the last update
+// without this second look the bisect could call a prefix non viable when it is viable
+// d_out_val holds max h after the last update and d_local_sep the running min separation
+__global__ void final_viable_check_kernel(const float* __restrict__ d_out_val,
+                                          const float* __restrict__ d_local_sep,
+                                          int* __restrict__ d_viable) {
     if (threadIdx.x == 0) {
         if (*d_local_sep > *d_out_val)
             *d_viable = 1;
     }
 }
 
-__global__ void final_viable_check_multi_kernel(
-    const float* __restrict__ gather_buf,  // [world_size * 2] packed (val, idx)
-    const int world_size,
-    const float* __restrict__ d_local_sep,  // [1]
-    int* __restrict__ d_viable)             // [1]
-{
+// same check when max h has to be taken over the gathered value and index pair of every rank
+__global__ void final_viable_check_multi_kernel(const float* __restrict__ gather_buf,
+                                                const int world_size,
+                                                const float* __restrict__ d_local_sep,
+                                                int* __restrict__ d_viable) {
     if (threadIdx.x == 0) {
         float best_val = -CUDART_INF_F;
         for (int r = 0; r < world_size; ++r) {
@@ -173,6 +175,7 @@ __global__ void final_viable_check_multi_kernel(
     }
 }
 
+// at most 1024 blocks of 256 threads for phase one, then one warp for phase two
 void argmax_cuda(torch::Tensor h, torch::Tensor block_vals, torch::Tensor block_idxs,
                  torch::Tensor d_out_val, torch::Tensor d_out_idx, int64_t N) {
     int n_blocks = (int) std::min((int64_t) MAX_ARGMAX_BLOCKS,
@@ -189,6 +192,7 @@ void argmax_cuda(torch::Tensor h, torch::Tensor block_vals, torch::Tensor block_
                                     n_blocks);
 }
 
+// same launch shape as argmax_cuda
 void max_val_cuda(torch::Tensor h, torch::Tensor block_vals, int64_t N, torch::Tensor d_out_val) {
     int n_blocks = (int) std::min((int64_t) MAX_ARGMAX_BLOCKS,
                                   (N + (int64_t) ARGMAX_THREADS - 1) / (int64_t) ARGMAX_THREADS);

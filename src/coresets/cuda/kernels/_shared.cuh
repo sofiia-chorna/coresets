@@ -1,13 +1,5 @@
 #pragma once
 
-// Common header for the split CUDA extension. Holds includes, constants,
-// forward declarations of every C++ wrapper, and the small __device__
-// template helpers shared across .cu files. CUDA cannot link __device__
-// templates across translation units, so they MUST live here as
-// `static __device__ __forceinline__` (each .cu gets its own copy).
-// Per-kernel templates that are dispatched via AT_DISPATCH at the call
-// site stay in their own .cu.
-
 #include <torch/extension.h>
 #include <pybind11/stl.h>
 #include <cuda.h>
@@ -20,36 +12,37 @@
 #include <vector>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
+// launch shape of the two phase argmax, python sizes its scratch from MAX_ARGMAX_BLOCKS
 static const int MAX_ARGMAX_BLOCKS = 1024;
 static const int ARGMAX_THREADS = 256;
 
-// ------------ Shared __device__ template helpers ------------
+// device helpers used by several .cu files live in this header
+// cuda cannot link device templates across files, so each .cu gets its own inlined copy
 
-// Tie-break: strictly greater value wins; on equal values, smaller index wins.
-// Used by argmax kernels (single-GPU) and the multi-GPU gather-buf reductions.
+// the larger value wins and on equal values the smaller index wins
+// every argmax and every cross rank reduction uses this rule, so 1 gpu and N gpus agree
 template <typename idx_t>
 static __device__ __forceinline__ bool argmax_better(float v_a, idx_t i_a, float v_b, idx_t i_b) {
     return (v_a > v_b) || (v_a == v_b && i_a < i_b);
 }
 
-// One warp dot-products row_ptr · x_new_smem (D coords). Lane k handles
-// every 32nd coord; caller reduces the 32 partials. Float4 fast-path on
-// D%4==0. __ldg routes the global load through the read-only cache.
+// dot product of one row with the new center, computed by one warp
+// each lane sums every 32nd coordinate and the caller adds up the 32 partial sums
 template <typename scalar_t>
 static __device__ __forceinline__ float warp_dot(const scalar_t* __restrict__ row_ptr,
                                                  const scalar_t* __restrict__ x_new_smem, int D,
                                                  int lane) {
     float dot = 0.0f;
+
     if constexpr (std::is_same<scalar_t, float>::value) {
         if (D % 4 == 0) {
-            // NB: a dual-load unrolled variant of this loop was tried (2026-06-10)
-            // and REGRESSED this helper's main consumers by ~18% (3.70->4.38 ms at
-            // 10.6M x 256) even though the same pattern helps the W-lane fused
-            // kernel in multi.cu — don't re-apply it here without re-measuring via
-            // bench/lanes_kernel_bench.sh.
+            // read four floats at a time when the row length allows it
+            // an unrolled version with two loads per step was slower here, keep this simple
             const float4* rp4 = reinterpret_cast<const float4*>(row_ptr);
             const float4* xn4 = reinterpret_cast<const float4*>(x_new_smem);
+
             for (int i = lane; i < D / 4; i += 32) {
+                // the row goes through the read only cache, the center is in shared memory
                 float4 a = __ldg(&rp4[i]);
                 float4 b = xn4[i];
                 dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
@@ -59,14 +52,16 @@ static __device__ __forceinline__ float warp_dot(const scalar_t* __restrict__ ro
                 dot += __ldg(&row_ptr[i]) * x_new_smem[i];
         }
     } else {
-        // float16 inputs, float32 accumulator (C2).
+        // half inputs are summed in float
         for (int i = lane; i < D; i += 32)
             dot += (float) row_ptr[i] * (float) x_new_smem[i];
     }
+
     return dot;
 }
 
-// ------------ Forward declarations of C++ wrappers ------------
+// host side wrappers, grouped by the .cu file that defines them
+
 // warp.cu
 void fps_update_cuda(torch::Tensor X, torch::Tensor norms, torch::Tensor x_new,
                      torch::Tensor hausdorff, torch::Tensor voronoi, torch::Tensor norm_new_t,
@@ -122,7 +117,7 @@ std::tuple<bool, int64_t> simulate_fps_voronoi(
     torch::Tensor sim_norms_sel, torch::Tensor sim_dSL_quarter, torch::Tensor d_local_sep,
     torch::Tensor d_viable, torch::Tensor sim_active_mask);
 
-// multi.cu — replicated-X path
+// multi.cu, replicated X path
 void pack_argmax_pair_cuda(torch::Tensor d_out_val, torch::Tensor d_out_idx, int64_t shard_offset,
                            torch::Tensor argmax_local_pack);
 
@@ -145,7 +140,7 @@ std::tuple<bool, int64_t> simulate_fps_voronoi_multi(
     int64_t points_left, int64_t shard_offset, int64_t N_shard, int64_t world_size,
     c10::intrusive_ptr<c10d::ProcessGroup> pg);
 
-// multi.cu — sharded-X path
+// multi.cu, sharded X path
 void pack_argmax_with_row_cuda(torch::Tensor X_local, torch::Tensor norms_local,
                                torch::Tensor d_out_val, torch::Tensor d_out_idx,
                                int64_t shard_offset, torch::Tensor argmax_local_pack);
